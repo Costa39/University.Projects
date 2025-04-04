@@ -1,0 +1,602 @@
+---
+title: "Skipass price: inference and prediction"
+author: "Alex Costa | Università Cattolica del Sacro Cuore | Applied Linear Models"
+date: "08/03/2024"
+output: pdf_document
+---
+
+```{r Packages Loading, include=FALSE}
+library(dplyr)
+library(leaps)
+library(corrplot)
+library(car)
+library(boot)
+library(effects)
+```
+
+# 1. Dataset description and goals
+
+```{r Dataset Loading, include=FALSE}
+resorts = read.csv("resorts.csv")
+```
+
+The purpose of this paper is to study how the price of a ski pass is influenced by the features of the associated ski resort. This information can be used to suggest a price more in line with the resort's features, which could lead to higher revenues. In order to achieve this goal we analyze the "Ski Resorts" dataset, which contains information about several features of 499 ski resorts in 5 different continents in the year 2022. The dataset was taken from Kaggle at the following link: https://www.kaggle.com/datasets/ulrikthygepedersen/ski-resorts. 
+The dataset contains 25 variables:
+
+- ID: resort ID;
+- Resort: resort name;
+- Latitude: resort latitude;
+- Longitude: resort longitude;
+- Country: resort country;
+- Continent: resort continent;
+- Price: ski pass cost for 1 adult for 1 day in the mean season in euro;
+- Season: start and end month of the ski season in that resort in 2022;
+- Highest point: resort's highest point in meters;
+- Lowest point: resort's lowest point in meters;
+- Beginner slopes: total length in km of children, blue, and green slopes at the resort;
+- Intermediate slopes: total length in km of red slopes at the resort;
+- Difficult slopes: total length in km of black, advanced, and expert slopes at the      resort;
+- Total slopes: total slope length in km;
+- Longest run: longest run in km;
+- Snow cannons: number of snow cannons;
+- Surface lifts: total number of surface lifts, including T-bars, Sunkids lifts, Rope lifts and people movers;
+- Chair lifts: number of chair lifts;
+- Gondola lifts: number of gondola lifts;
+- Total lifts: total number of lifts;
+- Lift capacity: number of passengers the resort's lift system can move in an hour;
+- Child friendly: the resort is child friendly or not;
+- Snowparks: the resort has a snowpark or not;
+- Night skiing: the resort offers skiing on illuminated slopes or not;
+- Summer skiing: the resort offers skiing during the summer or not.
+
+The number of observations and the number of variables are sufficient to allow us to conduct an adequate analysis. We omit the variables ID and Resort because they are just identifiers, and Country because it would be a categorical variable with 38 levels and we already have the variable Continent. Furthermore, we turn the variable Season into Season duration, a categorical variable with 3 levels: Short (from 1 to 4 months), Medium (5 or 6 months) and Long (from 7 to 12 months). We also group the levels Asia, Oceania and South America of the variable Continent into one level called Other, since these levels have very small numbers of observations compared to Europe and North America. Finally, we change the unit of measurement of Highest point and Lowest point from meters to kilometers by dividing both by 1000.
+
+```{r Factors, include=FALSE}
+n = nrow(resorts)
+resorts = resorts[,-c(1,2,5)]
+resorts$Continent = as.factor(resorts$Continent)
+resorts$Child.friendly = as.factor(resorts$Child.friendly)
+resorts$Snowparks = as.factor(resorts$Snowparks)
+resorts$Nightskiing = as.factor(resorts$Nightskiing)
+resorts$Summer.skiing = as.factor(resorts$Summer.skiing)
+resorts$Season = as.factor(resorts$Season)
+resorts$Highest.point = resorts$Highest.point/1000
+resorts$Lowest.point = resorts$Lowest.point/1000
+```
+
+```{r Season duration, include=FALSE}
+colnames(resorts)[5]= "Season.duration"
+levels(resorts$Season.duration) = c(1, 1, 5, 10, 4, 6, 1, 10, 4, 3, 12, 5, 4, 1, 
+                                  1, 6, 5, 6, 8, 5, 7, 10, 7, 9, 8, 12, 8, 10, 
+                                  9, NA, 12)
+resorts$Season.duration = as.integer(as.character(resorts$Season.duration))
+resorts$Season.duration[is.na(resorts$Season.duration)] = round(mean(resorts$Season.duration, na.rm = TRUE),digits = 0)
+resorts$Season.duration = as.factor(resorts$Season.duration)
+levels(resorts$Season.duration) = c("Short","Short","Short","Medium","Medium",
+                                  "Long","Long","Long","Long","Long")
+```
+
+```{r missing values Price, Lift Capacity, Longest Run, include=FALSE}
+resorts_europe = resorts[resorts$Continent == "Europe" & resorts$Price != 0,]
+resorts_asia = resorts[resorts$Continent == "Asia" & resorts$Price != 0,]
+resorts_namerica= resorts[resorts$Continent == "North America" & resorts$Price != 0,]
+resorts_oceania = resorts[resorts$Continent == "Oceania" & resorts$Price != 0,]
+resorts$Price[196] = round(mean(resorts_oceania$Price), digits = 0)
+resorts$Price[235] = round(mean(resorts_namerica$Price), digits = 0)
+resorts$Price[335] = resorts$Price[390] = resorts$Price[495] = round(mean(resorts_europe$Price), digits = 0)
+resorts$Price[349] = resorts$Price[369] = resorts$Price[387] = resorts$Price[475] = round(mean(resorts_asia$Price), digits = 0)
+rm(resorts_europe,resorts_asia,resorts_namerica,resorts_oceania)
+
+resorts$Lift.capacity[300] = 1100
+resorts$Lift.capacity[51] = round(mean(resorts[resorts$Total.lifts == 7,18]))
+
+resorts$Longest.run[resorts$Longest.run == 0] = round(mean(resorts$Longest.run))
+```
+
+```{r Continent levels, include=FALSE}
+levels(resorts$Continent) = dplyr::recode(levels(resorts$Continent),
+                                      "Europe" = "Europe", "Asia" = "Other", 
+                                      "North America" = "North America", 
+                                      "Oceania" = "Other", "South America" = "Other")
+resorts$Continent = relevel(resorts$Continent, ref = "Europe")
+```
+
+
+# 2. Exploratory Data Analysis
+
+First of all we perform an exploratory analysis in order to summarize and visualise the main characteristics of the dataset. Some of the most relevant plots are shown below.
+
+```{r eval=FALSE, include=FALSE}
+par(mfrow = c(1,2))
+boxplot(resorts$Highest.point ~ resorts$Season.duration, col="cyan1", las = 2)
+boxplot(resorts$Highest.point ~ resorts$Continent, col="cyan1", las = 2)
+
+mean(resorts$Price)
+median(resorts$Price)
+```
+```{r echo=FALSE, fig.align="center"}
+par(mfrow = c(1,3))
+
+hist(resorts$Price, col = "cyan3", main = "Histogram of Price", xlab = "")
+title(xlab = "Price", line = 2.4)
+mtext("Figure 1", side = 1, line = 4, cex = 0.9)
+
+boxplot(resorts$Price ~ resorts$Continent, main="Boxplot Price for Continent",
+        xlab="", ylab="Price", col="cyan3", names = c("Europe","Other","N.Ame."))
+title(xlab = "Continent", line = 2.4)
+mtext("Figure 2", side = 1, line = 4, cex = 0.9)
+
+boxplot(resorts$Price ~ resorts$Season.duration, main="Boxplot Price for Season
+        Duration", xlab="", ylab="Price", col="cyan3", names = c("Short","Med","Long"))
+title(xlab = "Season Duration", line = 2.4)
+mtext("Figure 3", side = 1, line = 4, cex = 0.9)
+```
+
+The response variable, Price, has a right-skewed distribution with a median of 45€ and a mean of 49.6€. We can see from the Figures 2 and 3 that Price has different quartiles depending on the Continent and the Season Duration. In particular, ski resorts in North America and with Long season durations have an higher median price compared to the others. 
+
+```{r echo=FALSE, out.width="76%", fig.align="center"}
+par(mfrow = c(1,3))
+hist(resorts$Longitude, col = "cyan3", main = "Histogram of Longitude", xlab = "")
+title(xlab = "Longitude", line = 2.4)
+mtext("Figure 4", side = 1, line = 4, cex = 0.9)
+
+hist(resorts$Highest.point, col = "cyan3", main = "Histogram of Highest point", xlab = "", ylim = c(0,140))
+title(xlab = "Highest point", line = 2.4)
+mtext("Figure 5", side = 1, line = 4, cex = 0.9)
+
+hist(resorts$Difficult.slopes, col = "cyan3", main = "Histogram of Difficult slopes", xlab = "",
+     ylim = c(0,300))
+title(xlab = "Difficult slopes", line = 2.4)
+mtext("Figure 6", side = 1, line = 4, cex = 0.9)
+```
+
+Most of the observations have a Longitude in the interval 0 - 50 (Figure 4). These are almost all the european ski resorts, which indeed are 360 out of 499. The variable Highest point (Figure 5) has an almost symmetrical distribution with a mean of 2161m and a median of 2175m. From Figure 6 we can see that the majority of the ski resorts have at most 20km of Difficult slopes and just 4% of the resorts have more than 60km. 
+
+```{r echo=FALSE}
+par(mfrow=c(1,1), mar = c(5, 4, 2, 2))
+plot(resorts[,c(4,6,7,11,12,13,18)], xaxt = "n", yaxt = "n", main = "Scatterplot matrix")
+mtext("Figure 7", side = 1, line = 4, cex = 0.9)
+```
+
+From Figure 7 we can visualize the relationship between the response variable and some of the continuous predictors and between these predictors themselves. Price seems to have a relationship in particular with Highest point, and there is a clear positive linear correlation between Highest point and Lowest point and between Total slopes and Lift capacity. These last two relationships makes total sense: the higher the maximum elevation, the higher the minimum elevation; the more km of slopes there are, the higher the lift capacity must be.
+
+```{r include=FALSE}
+resorts = resorts[,-c(11,17)]
+```
+
+
+# 3. Best subset selection
+
+We center all the predictors, that is, we subtract the mean of that predictor from each value, in order to have a more sensible interpretation of the coefficients that we are going to estimate later. Then, we fit a linear regression model with Price as response and all the other variables as predictors and we perform a best subset selection. We don't include Total Slopes because it is the sum, so a linear combination, of Beginner, Intermediate and Difficult slopes, and Total Lifts that is the sum of Surface, Chair and Gondola lifts.
+
+```{r Center data, include=FALSE}
+resorts_centered = resorts
+resorts_centered$Latitude = resorts$Latitude - mean(resorts$Latitude)
+resorts_centered$Longitude = resorts$Longitude - mean(resorts$Longitude)
+resorts_centered$Highest.point = resorts$Highest.point - mean(resorts$Highest.point)
+resorts_centered$Lowest.point = resorts$Lowest.point - mean(resorts$Lowest.point)
+resorts_centered$Beginner.slopes = resorts$Beginner.slopes - mean(resorts$Beginner.slopes)
+resorts_centered$Intermediate.slopes = resorts$Intermediate.slopes - mean(resorts$Intermediate.slopes)
+resorts_centered$Difficult.slopes = resorts$Difficult.slopes - mean(resorts$Difficult.slopes)
+resorts_centered$Longest.run = resorts$Longest.run - mean(resorts$Longest.run)
+resorts_centered$Snow.cannons = resorts$Snow.cannons - mean(resorts$Snow.cannons)
+resorts_centered$Surface.lifts = resorts$Surface.lifts - mean(resorts$Surface.lifts)
+resorts_centered$Chair.lifts = resorts$Chair.lifts - mean(resorts$Chair.lifts)
+resorts_centered$Gondola.lifts = resorts$Gondola.lifts - mean(resorts$Gondola.lifts)
+resorts_centered$Lift.capacity = resorts$Lift.capacity - mean(resorts$Lift.capacity)
+```
+```{r eval=FALSE, include=FALSE}
+inter1 = lm(Price ~ . + Highest.point*Continent, data = resorts_centered)
+nointer = lm(Price ~ ., data = resorts)
+anova(inter1, nointer)
+inter2 = lm(Price ~ . + Highest.point*Season.duration, data = resorts_centered)
+anova(inter2, nointer)
+inter3 = lm(Price ~ . + Difficult.slopes*Continent, data = resorts_centered)
+anova(inter3, nointer)
+```
+
+```{r include=FALSE}
+ols = regsubsets(Price ~ . , nvmax = 21, data = resorts_centered)
+summ = summary(ols)
+```
+
+The best subset selection gives as output the best model, so the one with smallest RSS, for each of the possible number of predictors. In our case the best model with 1 predictor contains the variable Continent North America, the best model with 2 predictors contains Continent North America and Difficult Slopes, and so on until the full model with all the 21 predictors.
+
+Now we have to choose the best overall model between the 21 models previously selected. We first look at some measures of goodness of fit: AIC, BIC, Mallow's Cp and Adjusted R^2.
+ 
+```{r echo=FALSE, out.width="70%", fig.align="center"}
+par(mar = c(6,3,2,3), mfrow=c(1,2))
+
+# AIC
+AIC = matrix(NA, 21, 1)
+for(j in 1:21){
+  AIC[j] = summ$bic[j] - (j+2)*log(n) + 2*(j+1)}
+plot(AIC, type="b", pch=19, xlab="Number of predictors", ylab="", main="Drop in AIC")
+abline(v=which.min(AIC),col = 2, lty=2)
+abline(v=7,col = "blue", lty=2)
+mtext("Figure 8", side = 1, line = 5, cex = 0.9)
+
+# BIC
+plot(summ$bic, type="b", pch=19,
+     xlab="Number of predictors", ylab="", main="Drop in BIC")
+abline(v=which.min(summ$bic),col = 2, lty=2)
+abline(v=7,col = "blue", lty=2)
+mtext("Figure 9", side = 1, line = 5, cex = 0.9)
+```
+
+```{r echo=FALSE, out.width="70%", fig.align="center"}
+par(mar = c(6,3,2,3), mfrow=c(1,2))
+
+# Cp
+plot(summ$cp, type="b", pch=19, 
+     xlab="Number of predictors", ylab="", main="Mallow' Cp")
+abline (v=which.min(summ$cp),col = 2, lty=2)
+abline(v=7,col = "blue", lty=2)
+mtext("Figure 10", side = 1, line = 5, cex = 0.9)
+
+#R2
+plot(summ$adjr2, type="b", pch=19, 
+     xlab="Number of predictors", ylab="", main="Adjusted R^2")
+abline (v=which.max(summ$adjr2),col = 2, lty=2)
+abline(v=7,col = "blue", lty=2)
+mtext("Figure 11", side = 1, line = 5, cex = 0.9)
+```
+
+The model with lowest AIC, BIC and Mallow's Cp is the one with 12 predictors, while the one with the highest Adjusted R^2 is the model with 18 predictors (red vertical lines). We also look at a measure of prediction accuracy: the Cross-Validation error. In particular, we consider the Mean Squared Error, computed with the Leave One Out method.
+
+```{r include=FALSE}
+levels(resorts_centered$Continent) = dplyr::recode(levels(resorts_centered$Continent),
+                                      "Europe" = "Other", "Other" = "Other", 
+                                      "North America" = "North America")
+```
+
+```{r include=FALSE}
+CV = c()
+glm.fit = glm(Price ~ Continent, data = resorts_centered)
+CV[1] = cv.glm(resorts_centered, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Continent + Difficult.slopes, data = resorts_centered)
+CV[2] = cv.glm(resorts_centered, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Continent + Difficult.slopes + Latitude, data = resorts_centered)
+CV[3] = cv.glm(resorts_centered, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Continent + Difficult.slopes + Highest.point + Summer.skiing , data = resorts_centered)
+CV[4] = cv.glm(resorts_centered, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Longitude + Continent + Difficult.slopes + Highest.point + Summer.skiing , data = resorts_centered)
+CV[5] = cv.glm(resorts_centered, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Longitude + Continent + Difficult.slopes + Highest.point + Snowparks + Summer.skiing , data = resorts_centered)
+CV[6] = cv.glm(resorts_centered, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Longitude + Continent + Difficult.slopes + Highest.point + Longest.run + Snowparks + Summer.skiing , data = resorts_centered)
+CV[7] = cv.glm(resorts_centered, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Longitude + Continent + Beginner.slopes + Difficult.slopes + Highest.point + Longest.run + Snowparks + Summer.skiing , data = resorts_centered)
+CV[8] = cv.glm(resorts_centered, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Longitude + Continent + Highest.point + Beginner.slopes + Difficult.slopes + Longest.run + Lift.capacity + Snowparks + Summer.skiing , data = resorts_centered)
+CV[9] = cv.glm(resorts_centered, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Latitude + Longitude + Continent + Highest.point + Beginner.slopes + Difficult.slopes + Longest.run + Lift.capacity + Snowparks , data = resorts)
+CV[10] = cv.glm(resorts, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Latitude + Longitude + Continent + Highest.point + Beginner.slopes + Difficult.slopes + Longest.run + Lift.capacity + Snowparks +Summer.skiing , data = resorts)
+CV[11] = cv.glm(resorts, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Latitude + Longitude + Continent + Highest.point + Beginner.slopes + Difficult.slopes + Longest.run + Lift.capacity + Child.friendly + Snowparks +Summer.skiing , data = resorts)
+CV[12] = cv.glm(resorts, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Latitude + Longitude + Continent + Season.duration + Highest.point + Beginner.slopes + Difficult.slopes + Longest.run + Lift.capacity + Child.friendly + Snowparks +Summer.skiing , data = resorts)
+CV[13] = cv.glm(resorts, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Latitude + Longitude + Continent + Season.duration + Highest.point + Beginner.slopes + Difficult.slopes + Longest.run + Lift.capacity + Child.friendly + Snowparks + Nightskiing + Summer.skiing , data = resorts)
+CV[14] = cv.glm(resorts, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Latitude + Longitude + Continent + Highest.point + Beginner.slopes + Difficult.slopes + Longest.run + Snow.cannons + Surface.lifts + Chair.lifts + Lift.capacity + Child.friendly + Snowparks + Summer.skiing , data = resorts)
+CV[15] = cv.glm(resorts, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Latitude + Longitude + Continent + Highest.point + Beginner.slopes + Difficult.slopes + Longest.run + Snow.cannons + Surface.lifts + Chair.lifts + Lift.capacity + Child.friendly + Snowparks + Nightskiing + Summer.skiing , data = resorts)
+CV[16] = cv.glm(resorts, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Latitude + Longitude + Continent + Season.duration + Highest.point + Beginner.slopes + Difficult.slopes + Longest.run + Snow.cannons + Surface.lifts + Chair.lifts + Lift.capacity + Child.friendly + Snowparks + Nightskiing + Summer.skiing , data = resorts)
+CV[17] = cv.glm(resorts, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Latitude + Longitude + Continent + Season.duration + Highest.point + Beginner.slopes + Intermediate.slopes + Difficult.slopes + Longest.run + Snow.cannons + Surface.lifts + Chair.lifts + Lift.capacity + Child.friendly + Snowparks + Nightskiing + Summer.skiing , data = resorts)
+CV[18] = cv.glm(resorts, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Latitude + Longitude + Continent + Season.duration + Highest.point + Lowest.point + Beginner.slopes + Intermediate.slopes + Difficult.slopes + Longest.run + Snow.cannons + Surface.lifts + Chair.lifts + Lift.capacity + Child.friendly + Snowparks + Nightskiing + Summer.skiing , data = resorts)
+CV[19] = cv.glm(resorts, glm.fit)$delta[1]
+glm.fit = glm(Price ~ Latitude + Longitude + Continent + Season.duration + Highest.point + Lowest.point + Beginner.slopes + Intermediate.slopes + Difficult.slopes + Longest.run + Snow.cannons + Surface.lifts + Chair.lifts + Gondola.lifts + Lift.capacity + Child.friendly + Snowparks + Nightskiing + Summer.skiing , data = resorts)
+CV[20] = cv.glm(resorts, glm.fit)$delta[1]
+glm.fit = glm(Price ~ ., data = resorts)
+CV[21] = cv.glm(resorts, glm.fit)$delta[1]
+```
+
+```{r echo=FALSE, out.width="80%", fig.align="center"}
+plot(1:21, CV, type="b", pch=19, cex=0.7, xlab="", ylab="MSE", main="LOOCV")
+title(xlab = "Number of predictors", line = 2.4)
+abline(v=which.min(CV),col = 2, lty=2)
+abline(v=7,col = "blue", lty=2)
+mtext("Figure 12", side = 1, line = 4, cex = 0.9)
+```
+
+The model with the lowest MSE, and therefore the best in terms of prediction performance, is the model with 11 predictors. Now, applying the Occam's razor principle we choose the model with 7 predictors because it is the number of predictors after which all the analyzed metrics more or less flatten out (blue vertical lines). These 7 predictors, according to the best subset selection are: Longitude, Continent North America, Highest Point, Difficult Slopes, Longest Run, Snowparks and Summer Skiing:
+
+```{r include=FALSE}
+ols_best = lm(Price ~ Longitude + Continent + Highest.point + Difficult.slopes 
+              + Longest.run + Snowparks + Summer.skiing , data = resorts_centered)
+```
+
+
+# 4. Collinearity
+
+We check for potential collinearity issues between the selected predictors. We first look at the correlation matrix and in particular to its associated corrplot to visualize the correlation between the continuous predictors.
+
+```{r echo=FALSE, out.width="85%", fig.align="center"}
+corrplot(cor(resorts_centered[,c(2,6,10,11)]), method = "ellipse", mar = c(2,0,1,0),
+         main = "Correlation plot")
+mtext("Figure 13", side = 1, line = 3.5, cex = 0.9)
+```
+
+Difficult slopes has a slight correlation with Highest point (cor = 0.48) and Longitude (cor = -0.39). However, these are acceptable levels of correlation that should not cause problems. We check also the VIF (Variance of Inflation Factor), which is another measure of correlation, also suitable for categorical variables.
+
+```{r echo=FALSE}
+vif(ols_best)
+```
+All the predictors have a VIF much lower than 10, which is the most widespread rule of thumb for deciding if collinearity is high. Hence, we can confirm that we don't have collinearity issues.
+
+
+# 5. Diagnostics and unusual observations
+
+We check whether our model respects the assumptions of the normal multiple linear regression model, which, we recall, are: independence, homoscedasticity and normality of the errors and linearity of the model. We start by looking at the scatterplot of residuals vs fitted values.
+
+```{r echo=FALSE, out.width="90%"}
+plot(fitted(ols_best), residuals(ols_best), xlab="", ylab="Residuals",
+     pch=19, cex=0.8, main = "Residuals vs Fitted")
+title(xlab = "Fitted values", line = 2.4)
+abline(h = 0, col=2, lwd = 2)
+mtext("Figure 14", side = 1, line = 4, cex = 0.9)
+```
+
+From Figure 14 we can see that the variance of the errors increases as the fitted values increase. Therefore, we have an heteroscedasticity issue. The pattern is also not perfectly linear.
+
+```{r eval=FALSE, include=FALSE}
+residualPlots(ols_best)
+```
+
+```{r echo=FALSE, out.width="90%", fig.align="center"}
+# Normality
+par(mfrow = c(1,2))
+qqnorm(resorts$Price, pch = 16, col = "cyan3")
+qqline(resorts$Price, lwd = 2)
+mtext("Figure 15", side = 1, line = 4, cex = 0.9)
+hist(resorts$Price, freq = FALSE, col = "cyan3", main = "Histogram of Price",
+     ylim = c(0,0.03), ylab = "Price")
+lines(density(resorts$Price), lwd = 2)
+mtext("Figure 16", side = 1, line = 4, cex = 0.9)
+```
+
+From the Q-Q plot (Figure 15) and the histogram of Price, we can see that the response variable is not normally distributed, indeed it has a right-skewed distribution, as already mentioned before. This could be a problem because if the assumption of normality of the errors is not met, the reliability of the results in terms of inference (confidence intervals and hypothesis testing) of our model will be limited, so we will try to fix this problem.
+
+```{r eval=FALSE, include=FALSE}
+shapiro.test(resorts$Price)
+```
+
+Now we check if there are unusual observations: outliers, high leverage points and influential points.
+
+```{r echo=FALSE, fig.align="center"}
+par(mfrow = c(1,3))
+
+# Outliers
+outliers = abs(rstandard(ols_best)) > 3
+x_outliers = which(outliers)
+y_outliers = abs(rstandard(ols_best))[outliers]
+plot(abs(rstandard(ols_best)), pch = 16, ylim = c(0,5), main = "Outliers Detection",
+     ylab = "|Studentized Residuals|", xlab = "")
+abline(h = 3, col = 'red', lty = 2, lwd = 2)
+text(x_outliers, y_outliers, labels = x_outliers, cex = 0.8, pos = 3)
+legend("topright", legend = "Threshold", lty = 2, lwd = 1.5, col = 'red', cex = 0.8)
+title(xlab = "Index", line = 2.4)
+mtext("Figure 17", side = 1, line = 4, cex = 0.9)
+
+# High Leverage points
+h_values = hatvalues(ols_best)
+plot(h_values, pch = 16, ylab = "Levegares", main = "High Leverage Points Detection",
+     ylim = c(0,0.09), xlab = "")
+abline(h = (2*length(coef(ols_best)))/n, col = 'red', lty = 2, lwd = 2)
+legend(x = "topright", legend = "2(p+1)/n", lty = 2, lwd = 1.5, col = 'red', cex = 0.8)
+title(xlab = "Index", line = 2.4)
+mtext("Figure 18", side = 1, line = 4, cex = 0.9)
+
+# Influential points
+plot(cooks.distance(ols_best), pch = 16, ylim = c(0,0.6), ylab = "Cook's distance",
+     main = "Influential points Detection", xlab = "")
+abline(h = 0.5, col = 'red', lty = 2, lwd = 2)
+title(xlab = "Index", line = 2.4)
+mtext("Figure 19", side = 1, line = 4, cex = 0.9)
+```
+
+From Figures 17 and 18 we can see that we have quite a few outliers and high leverage points, but none of them are influential (Figure 19), so none of them have a big influence on the fitting and on the inference.
+
+
+# 6. Model improvement
+
+We need to fix heteroscedasticity and non normality of the errors. We try some transformations of the response variable that could potentially fix both the issues: $\sqrt y$ , $\log y$ and $\frac{1}{y}$. The $\log y$ and $\frac{1}{y}$ transformations do not improve heteroscedasticity nor normality, they even make things worse. The square root leads to a very slight improvement for heteroscedasticity:
+
+```{r echo=FALSE, out.width="50%"}
+
+plot(fitted(ols_best), residuals(ols_best), xlab="", ylab="Residuals",
+     pch=19, cex=0.8, main = "y")
+title(xlab = "Fitted values", line = 2.4)
+abline(h = 0, col=2, lwd = 2)
+mtext("Figure 20", side = 1, line = 4, cex = 0.9)
+
+
+ols_sqrt = lm(sqrt(Price) ~ Longitude + Continent + Highest.point + Difficult.slopes + 
+                Longest.run + Snowparks + Summer.skiing , data = resorts_centered)
+
+plot(fitted(ols_sqrt), residuals(ols_sqrt), xlab="", ylab="Residuals",
+     pch=19, cex=0.8, main = "Sqrt(y)")
+title(xlab = "Fitted values", line = 2.4)
+abline(h = 0, col=2, lwd = 2)
+mtext("Figure 21", side = 1, line = 4, cex = 0.9)
+```
+
+```{r echo=FALSE, out.width="90%", fig.align="center"}
+
+par(mfrow = c(1,2))
+
+qqnorm(resorts$Price, pch = 16, col = "cyan3", main = "y")
+qqline(resorts$Price, lwd = 2)
+mtext("Figure 22", side = 1, line = 4, cex = 0.9)
+
+qqnorm(sqrt(resorts$Price), pch = 16, col = "cyan3", main = "Sqrt(y)")
+qqline(sqrt(resorts$Price), lwd = 2)
+mtext("Figure 23", side = 1, line = 4, cex = 0.9)
+```
+
+However, these improvements are so small that they do not make a y transformation convenient, so we keep things as they are, aware of the fact that the results in terms of inference will not be completely reliable due to non normality of the response.
+
+```{r eval=FALSE, include=FALSE}
+ols_log = lm(log(Price) ~ Longitude + Continent + Highest.point + Difficult.slopes + 
+                Longest.run + Snowparks + Summer.skiing , data = resorts_centered)
+
+plot(fitted(ols_log), residuals(ols_log), xlab="", ylab="Residuals",
+     pch=19, cex=0.8, main = "Log(y)")
+title(xlab = "Fitted values", line = 2.4)
+abline(h = 0, col=2, lwd = 2)
+
+ols_rec = lm((1/Price) ~ Longitude + Continent + Highest.point + Difficult.slopes + 
+                Longest.run + Snowparks + Summer.skiing , data = resorts_centered)
+
+plot(fitted(ols_rec), residuals(ols_rec), xlab="", ylab="Residuals",
+     pch=19, cex=0.8, main = "1/y")
+title(xlab = "Fitted values", line = 2.4)
+abline(h = 0, col=2, lwd = 2)
+```
+
+
+# 7. Coefficients of the best model
+
+We can see below the estimated coefficients of the best model:
+
+```{r echo=FALSE}
+summary(ols_best)$coefficients[,1]
+```
+
+Hence, the best fitted model is:
+
+$$
+\hat y_i = \ 37.58 + 0.08LN{i} \ + \ 39.38NA{i} + \ 4.74HP{i} + 0.25DS{i} + \ 0.59LR{i} + \ 4.60SP{i} + \ 13.51SS{i}
+$$
+
+This means that:
+
+- The price of a skipass of a resort which is not in North America, has not a snowpark nor summer skiing, and has longitude, highest point, difficult slopes and longest run equal to their mean values, has an estimated price of 37.58€.
+- The price of a skipass is estimated to increase of 0.08€ for every increase of one degree of longitude, all other variables being equal.
+- The price of a skipass in North America, all other variables being equal, is estimated to be 39.38€ higher than a skipass in the rest of the world.
+- The price of a skipass is estimated to increase of 4.74€ for every increase of 1000m in the highest point, all other variables being equal.
+- The price of a skipass is estimated to increase of 0.25€ for every additional km of difficult slopes, all other variables being equal.
+- The price of a skipass is estimated to increase of 0.59€ for every additional km in the longest run, all other variables being equal.
+- The price of a skipass of a resort that has a snowpark, all other variables being equal, is estimated to be 4.60€ higher than a skipass of a resort that has not a snowpark.
+- The price of a skipass of a resort that offers summer skiing, all other variables being equal, is estimated to be 13.51€ higher than a skipass of a resort that has not a snowpark.
+
+We also compute the 95% confidence intervals for the estimated coefficients:
+
+```{r echo=FALSE}
+confint(ols_best)
+```
+
+The following plots show the estimated effects of Highest point and Difficult slopes on Price:
+
+```{r echo=FALSE, out.width="50%"}
+par(mfrow=c(1,2), mar = c(5, 4, 5, 2))
+plot(predictorEffect("Highest.point", ols_best))
+
+plot(predictorEffect("Difficult.slopes", ols_best))
+```
+
+The dark blue lines are the fitted lines of two simple linear regression models, one with Highest point as the predictor and the other with Difficult slopes as predictor, while all the others are fixed at their average values, which are all 0 because they have been centered. The light blue areas around the lines are the 95% confidence intervals of the slopes. An interesting thing to notice is the fact that the interval becomes wider as Difficult slopes increases.
+
+
+# 8. Tests for the coefficients
+
+We perform both individual and global tests on the significance of the coefficients. We start with the following individual test for each $\beta_j$:
+
+$$
+\begin{cases}
+  H_0 : \beta_j = 0
+  \\H_1 : \beta_j \neq 0
+\end{cases}\
+$$
+
+We can find the values of the t static and the corresponding p-values of these tests in the coefficients section of the summary of the model:
+
+```{r echo=FALSE}
+summary(ols_best)$coefficients
+```
+
+If we set as level of significance the standard 5% we reject all the null hypotheses and we can say that all the coefficients are statistically significant, i.e. different from 0.
+
+We now test all of the $\beta_j$ (except the intercept) to be 0 simultaneously, which is equivalent to the following test:
+
+$$
+\begin{cases}
+  H_0 : y = \beta_0 + \epsilon
+  \\H_1 : y = \beta_0 + \beta_1x_1 + \beta_2x_2 + \beta_3x_3 + \beta_4x_4 + \beta_5x_5 + \beta_6x_6 + \beta_7x_7 + \epsilon
+\end{cases}\
+$$
+
+This test is also called Global F-Test and we find the associated F-statistic and p-value in the last row of the summary of the model: 
+
+```{r echo=FALSE}
+summary(ols_best)
+```
+
+The p-value is much lower than 0.05, hence we reject the null hypothesis and we can say that at least one $\beta_j$ is statistically significant, i.e. different from 0.
+
+
+# 9. Goodness of fit
+
+To evaluate the goodness of fit of our linear regression model we consider the adjusted $R^2$:
+
+```{r echo=FALSE}
+summary(ols_best)$adj.r.squared
+```
+
+Around 65.2% of the variability of price is explained by the model so the fit is not ideal, it could be better, but still is a good starting point.
+
+
+# 10. Prediction
+
+We suppose to have a new observation about a real ski resort which is not present in the dataset. We want to predict the price of the ski pass of the resort "Hoodoo Ski Area", located in Oregon, USA, North America. We find on the web all the information we need about this resort to predict the price using our model: 
+
+- Longitude = -121.872
+- Continent = North America
+- Highest point = 1740m
+- Difficult slopes = 3km
+- Longest run = 2km
+- Snowparks = Yes
+- Summer skiing = No
+
+```{r include=FALSE}
+newdata = data.frame(Longitude = -121.872 - mean(resorts$Longitude), Continent = "North America", Highest.point = 1.74 - mean(resorts$Highest.point), Difficult.slopes = 3 - mean(resorts$Difficult.slopes), Longest.run = 2 - mean(resorts$Longest.run), Snowparks = "Yes", Summer.skiing = "No") 
+```
+
+```{r echo=FALSE}
+predict(ols_best, newdata = newdata, interval = "prediction", level = 0.95)
+```
+
+Our model predicts the price of the Hoodoo Ski Area's skipass to be around 65€, with a 95% confidence interval: [41€, 89€]. The real medium price is around 70€, so the prediction of the model is not bad.
+
+
+# 11. Simulation
+
+We simulate 499 data points from the fitted regression model, assuming the
+estimated parameters as the true parameters. We then plot the simulated points against the observed points. 
+
+```{r echo=FALSE, fig.align="center"}
+set.seed(1234)
+
+beta = coefficients(ols_best)
+X = model.matrix(ols_best)
+y = X%*%beta + rnorm(n, 0, sigma(ols_best))
+
+plot(resorts_centered$Price, y, xlab="", ylab= "Simulated Y", pch = 16, 
+     col = "cyan3", xlim = c(-4,142), ylim = c(-4,142), main = "Simulated vs Observed")
+abline(a=0, b=1)
+title(xlab = "Observed Y", line = 2.4)
+mtext("Figure 26", side = 1, line = 4, cex = 0.9)
+```
+
+For large values of the observed y, the simulated y do not follow the line. This was expected because we saw from the Q-Q plot (Figure 15) that the large quantiles of the distribution of Price are bigger than the quantiles of a Normal distribution. Indeed, we can see here that simulating those points assuming normal errors leads to having simulated values lower than the observed values.
+
+
+# 12. Conclusion
+
+We have built a linear regression model that explains the Price of the ski pass of a resort based on Longitude, Continent, Highest Point, Difficult Slopes, Longest Run, Snowparks and Summer Skiing. The goodness of fit is not ideal but it is a good starting point for possible further analysis. Furthermore, errors do not properly respect the assumption of normality. Despite that, this model can be useful to establish the price of the ski pass for any new ski resorts, or to modify that of existing ski resorts. In the future we could try some kind of non linear regression, compare the results and choose the best model.
+
