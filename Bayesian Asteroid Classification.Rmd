@@ -1,0 +1,681 @@
+---
+title: "A Bayesian approach to asteroid hazard classification: Logit vs Probit"
+author: "Alex Costa, Sara Pascali | Università Cattolica del Sacro Cuore | Bayesian Modelling"
+date: "25/06/2024"
+output: pdf_document
+---
+
+```{r include=FALSE}
+library(R2jags)
+library(coda)
+library(ggplot2)
+library(lattice)
+library(recipes)
+library(dplyr)
+library(caret)
+library(knitr)
+library(kableExtra)
+library(pROC)
+```
+
+```{r setup, include=FALSE}
+asteroids <- read.csv("nasa.csv")
+
+# Remove unnecessary variables
+asteroids <- asteroids[,c(3,4,5,14,19,24,25,28,29,30,32,33,34,35,37,38,40)]
+
+# Transform min and max estimated diameter into mean estimated diameter
+asteroids$Est.Dia.in.KM.min. <- (asteroids$Est.Dia.in.KM.min.+asteroids$Est.Dia.in.KM.max.)/2
+names(asteroids)[2] <- "Estimated.Diameter"
+asteroids <- asteroids[,-3]
+
+# Column names
+names(asteroids)[3] <- "Relative.Velocity"
+names(asteroids)[4] <- "Miss.Distance"
+names(asteroids)[6] <- "Min.Orbit.Intersection"
+names(asteroids)[12] <- "Perihelion.Dist"
+
+# Hazardous -> (0,1)
+asteroids$Hazardous <- ifelse(asteroids$Hazardous == "True", 1, 0)
+
+# Orbit uncertainty -> factor with 3 levels
+asteroids$Orbit.Uncertainity <- cut(asteroids$Orbit.Uncertainity, 
+                  breaks = c(-Inf, 2, 6, 10), labels = c(1, 2, 3), right = TRUE)
+```
+
+# 1 Introduction
+
+In this project we adopt a **Bayesian regression** framework to model the probability that an asteroid poses an hazard to Earth, incorporating prior beliefs and accounting for parameter uncertainty. Understanding the key orbital and physical characteristics that contribute to asteroid hazard classification is critical for planetary defense strategies and space mission planning. The dataset used is publicly available on Kaggle (sourced from NASA's Center for Near Earth Object Studies):
+https://www.kaggle.com/datasets/lovishbansal123/nasa-asteroids-classification
+
+The Bayesian approach is particularly suited for this context due to the interpretability of posterior distributions, the ability to incorporate prior expert knowledge, and the robustness it offers in small-sample or imbalanced data scenarios. In our dataset indeed the response variable **Hazardous** is notably unbalanced, with only about 15.5% of the 4,687 asteroids classified as hazardous. 
+
+We begin with exploratory data analysis and preprocessing, followed by the implementation of Bayesian logistic and Bayesian probit regression models. Model performance is evaluated through posterior predictive checks, classification accuracy, and ROC curve analysis on a held-out test set.
+
+In addition to the response variable, the dataset contains 15 predictors:
+
+• **Absolute Magnitude**: A standardized measure of an asteroid's luminosity.
+
+• **Estimated Diameter**: An estimate of the diameter of an asteroid expressed in kilometers.
+
+• **Relative Velocity**: The speed at which an asteroid moves relative to Earth during its close approach, expressed in kilometers per second.
+
+• **Miss Distance**: The minimum distance at which the asteroid will pass by Earth during a close approach, expressed in kilometers.
+
+• **Orbit Uncertainty**: The uncertainty of the estimated orbital parameters: 1 = Low Uncertainty; 2 = Medium Uncertainty; 3 = High Uncertainty.
+
+• **Minimum Orbit Intersection**: The minimum distance between the object's orbit and Earth's orbit, expressed in Astronomical Units (1 AU = 1,496e+8 Km).
+
+• **Eccentricity**: The shape of the orbit, with values ranging from 0 (circular orbit) to 1 (highly elongated elliptical orbit).
+
+• **Semi Major Axis**: One half of the longest diameter of the elliptical orbit, expressed in Astronomical Units. It essentially defines the size of the orbit.
+
+• **Inclination**: The angle between the asteroid's orbital plane and the ecliptic plane (Earth's orbital plane), evaluated in degrees.
+
+• **Orbital Period**: The time required for the asteroid to complete one full orbit around the Sun, expressed in years.
+
+• **Perihelion Distance**: The distance from the asteroid's Perihelion (the closest point in the orbit to the Sun) to the Sun, expressed in Astronomical Units.
+
+• **Perihelion Argument**: The angle between the ascending node and the Perihelion, expressed in degrees.
+
+• **Aphelion Distance**: The distance from the asteroid's Aphelion (the farthest point in the orbit to the Sun) to the Sun, expressed in Astronomical Units.
+
+• **Mean Anomaly**: The fraction of the orbit already completed by the asteroid since Perihelion, expressed in degrees.
+
+• **Mean Motion**: The average angular speed at which the asteroid orbits the Sun, expressed in degrees per day.
+
+
+## 2. Exploratory Data Analysis
+
+To evaluate model performance and ensure generalizability, we partition the dataset of 4,687 asteroid observations into two subsets: 80% of the data is allocated to the training set, which is used for model fitting, while the remaining 20% forms the test set, reserved for out-of-sample evaluation. This split allows us to assess how well the Bayesian models perform on unseen data.
+
+```{r include=FALSE}
+set.seed(42)
+n = dim(asteroids)[1]
+select.train = sample(1:n, n*0.8)
+train = asteroids[select.train,]
+test = asteroids[-select.train,]
+```
+
+We start with an exploratory analysis of the training data, presenting the most relevant plots below: 
+
+```{r echo=FALSE}
+# Histograms
+par(mfrow=c(2,2))
+boxplot(Absolute.Magnitude ~ Hazardous, data = train, main = "Absolute Magnitude VS Hazardous", 
+        col = c("blue", "cyan2"), ylab="Abs.Magnitude", xlab="")
+mtext("Figure 1", side=1, line=2, cex=0.7)
+boxplot(Estimated.Diameter ~ Hazardous, data = train, main = "Est.Diametere VS Hazardous", 
+        col = c("blue", "cyan2"), ylab="Est.Diametere", xlab="", ylim = c(0,3.4))
+mtext("Figure 2", side=1, line=2, cex=0.7)
+boxplot(Min.Orbit.Intersection ~ Hazardous, data = train, main = "Min.Orbit.Int VS Hazardous", col = c("blue", "cyan2"), ylab="Min.Orbit.Int", xlab="")
+mtext("Figure 3", side=1, line=2, cex=0.7)
+mosaicplot(table(train$Orbit.Uncertainity, train$Hazardous), col = c("blue", "cyan"), main="Orbit Uncertainity", border = "black", ylab = "Hazardous")
+mtext("Figure 4", side=1, line=2, cex=0.7)
+```
+
+Figure 1: hazardous asteroids tend to have lower absolute magnitudes, meaning they are brighter or more luminous. Since brightness often correlates with size and visibility, this might suggest hazardous asteroids are larger or more detectable.
+
+FIgure 2: hazardous asteroids generally have larger estimated diameters, but the distribution is highly skewed (with some extreme outliers).
+
+Figure 3: hazardous asteroids have a significantly lower Minimum Orbit Intersection, meaning they pass closer to Earth's orbit.
+
+Figure 4: almost all hazardous asteroids have an orbit uncertainty level 1, suggesting that hazardous asteroids tend to have well-defined orbits, likely because they are tracked more carefully.
+
+Prior to fitting the Bayesian models, we standardize the numeric predictors in both the training and test sets by subtracting the sample mean and dividing by the standard deviation (z-score standardization). This is applied to all continuous variables, excluding the intercept and categorical predictors. Standardization enhances the efficiency and convergence of Markov Chain Monte Carlo (MCMC) algorithms and enables a more interpretable comparison of the resulting regression coefficients, as they are placed on a common scale.
+
+```{r include=FALSE}
+X.train = model.matrix(Hazardous ~., train)
+y.train = train$Hazardous
+
+X.test = model.matrix(Hazardous ~., test)
+y.test = test$Hazardous
+
+p = ncol(X.train)
+```
+
+```{r include=FALSE}
+# Standardize numeric columns (mean = 0, sd = 1)
+X.train[, -c(1,6,7)] <- scale(X.train[, -c(1,6,7)], center = T, scale = T)
+X.test[, -c(1,6,7)] <- scale(X.test[, -c(1,6,7)], center = T, scale = T)
+```
+
+
+# 3 GLM for binary response variables
+
+Generalized Linear Models (GLMs)  extend ordinary linear regression to response variables that follow distributions other than the Normal.
+
+In our context, the response variable is binary: it takes value 1 if the asteroid is classified as hazardous, and 0 otherwise. Therefore, the appropriate likelihood is a Bernoulli distribution with success probability $\pi_i$ representing the probability that the $i$-th asteroid is hazardous.
+
+GLMs link the expected value of the response to a linear combination of the predictors via a **link function**. In this analysis, we consider and compare two popular link functions for binary responses: the logit and the probit.
+
+## 3.1 Logistic regression
+
+Logistic regression uses the logit link function:
+
+$$
+\pi_i = h(\boldsymbol{\beta}^T\boldsymbol{x}_i)=\frac{e^{\boldsymbol{\beta}^T\boldsymbol{x}_i}}{1+e^{\boldsymbol{\beta}^T\boldsymbol{x}_i}}\ \ \ \ \ \ \ \ \Leftrightarrow \ \ \ \ \ \ log(\frac{\pi_i}{1-\pi_i}) = \boldsymbol{\beta}^T\boldsymbol{x}_i
+$$
+
+The corresponding likelihood function is:
+
+$$
+p(\boldsymbol{y}|\boldsymbol{\beta}) = \prod_{i=1}^{n}p(y_i|\pi_i) = \prod_{i=1}^{n}h(\boldsymbol{\beta}^T\boldsymbol{x}_i)^{y_i}(1-h(\boldsymbol{\beta}^T\boldsymbol{x}_i))^{1-y_i}
+$$
+
+We place **independent Normal** priors on the regression coefficients, so that the joint prior is the product of the marginal priors:
+
+$$
+\beta_j \stackrel{ind}{\sim} N(\beta_{0j},\sigma^2_{0j}) \ \ \ \Rightarrow \ \ \ p(\boldsymbol{\beta}) = \prod_{j=1}^{p}dN(\beta_j|\beta_{0j},\sigma^2_{0j})
+$$
+
+Since this prior is not conjugate, we estimate the posterior distribution via the **Metropolis-Hastings algorithm**.
+
+## 3.2 Probit regression
+
+In probit regression, the link function is the inverse of the standard normal CDF:
+
+$$
+\pi_i = h(\boldsymbol{\beta}^T\boldsymbol{x}_i)=\Phi(\boldsymbol{\beta}^T\boldsymbol{x}_i)\ \ \ \ \ \ \ \Leftrightarrow \ \ \ \ \ \ \Phi^{-1}(\pi_i)=\boldsymbol{\beta}^T\boldsymbol{x}_i
+$$
+The likelihood and priors remain the same as in logistic regression. However, the probit model admits a latent variable formulation, allowing us to derive full conditional distributions and implement a **Gibbs sampler**.
+
+Assume that for each observation $y_i$, there exists a latent variable $z_i$ such that:
+
+$$
+z_i|\boldsymbol\beta \stackrel{ind}{\sim} N(\boldsymbol{\beta}^T\boldsymbol{x}_i,1) \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \boldsymbol{\beta} \sim N_p(\boldsymbol{\beta}_0,\boldsymbol{V}^{-1})
+$$
+
+We obtain the following full conditional distributions for $\boldsymbol z$ and $\boldsymbol\beta$:
+
+$$
+z_i|\boldsymbol\beta, y_i \stackrel{ind}{\sim} tN(\boldsymbol{\beta}^T\boldsymbol{x}_i,1,\theta_{y_i-1},\theta_{y_i}) \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \boldsymbol{\beta}|\boldsymbol y, \boldsymbol z \sim N_p(\tilde{\boldsymbol{\beta}},\tilde{\boldsymbol{V}}^{-1})
+$$
+
+Sampling alternately from these distributions yields draws from the posterior of $\boldsymbol{\beta}$.
+
+
+## 3.3 Prediction via Bayesian Model Averaging
+
+Rather than selecting a single model, we use **Bayesian Model Averaging (BMA)** to account for model uncertainty in the predictions. Let $\boldsymbol{\gamma} = (\gamma_1, ..., \gamma_p)^T$ be a binary vector indicating inclusion of each predictor:
+
+$$
+\gamma_j=\begin{cases}
+  1 \ \ \ \ \ \ \ \ \ \text{if} \ \ X_j \ \ \text{is included in the model}
+  \\0 \ \ \ \ \ \ \ \ \ \text{otherwise}
+\end{cases}\
+$$
+
+The model becomes:
+
+$$
+E(Y|x) = h(\gamma_1\beta_1X_1 + ... + \gamma_p\beta_pX_p)
+$$
+
+
+We assign the following priors:
+
+$$
+\beta_j|\gamma_j=1 \stackrel{ind}{\sim} N(\beta_{0j},\sigma^2_{0j}) \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \gamma_j\stackrel{iid}{\sim} Ber(w) \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ w \sim Beta(a,b)
+$$
+
+This leads to the **spike-and-slab** prior:
+
+$$
+p(\beta_j,\gamma_j) = (1-w)\delta_0 + wdN(\beta_j|\beta_{0j},\sigma^2_{0j})
+$$
+
+Given $S$ posterior samples ${(\boldsymbol{\beta}^{(s)}, \boldsymbol{\gamma}^{(s)})}_{s=1}^{S}$ obtained through Gibbs Sampling or Metropolis Hastings, the predictive distribution for a new input $\boldsymbol{x}^*$ is approximated by:
+
+1) Compute $\eta^{(s)} = \gamma_1^{(s)}\beta_1^{(s)}x_1^*+...+\gamma_p^{(s)}\beta_p^{(s)}x_p^*$
+
+2) Compute $\mu^{(s)} = h(\eta^{(s)})$
+
+3) Sample $y^{*(s)}$ from $p(y^*|\mu^{(s)})$
+
+The result is a posterior predictive sample for the new observation, capturing uncertainty in both parameter values and model structure.
+
+
+# 4 Posterior distributions approximation
+
+## 4.1 Logit regression
+
+We apply the logistic regression model as introduced in Section 3.1 to the asteroid dataset. Since the model does not admit a closed-form posterior distribution, we use the Metropolis-Hastings algorithm to sample from the posterior of the regression coefficients $\beta_j$.
+
+All numeric predictors are standardized, allowing us to adopt weakly informative priors centered at zero with unit variance:
+
+$$
+\beta_j \sim N(0,1) \ \ \ \ \ \ \ \ \ \ \ \forall j
+$$
+To perform Bayesian variable selection, we also introduce latent binary indicators $\gamma_j \sim \text{Bern}(w)$, where $w \sim \text{Beta}(1,1)$ is an unknown prior inclusion probability. The posterior is approximated using a JAGS model. We initialize the sampler with beta = 0 and all variables included (gamma = 1), and run the model for 5,000 iterations with a burn-in of 1,000. Posterior samples are extracted for both $\beta$ and $\gamma$.
+
+```{r include=FALSE}
+logistic_regr_jags = function(){
+  
+  # Likelihood
+  for(i in 1:n){
+    y[i] ~ dbern(pi[i])
+    logit(pi[i]) = (gamma*beta)%*%X[i,]
+  }
+  
+  # Priors
+  for(j in 1:p){
+    beta[j] ~ dnorm(0, 1)
+    gamma[j] ~ dbern(w)
+  }
+  
+  w ~ dbeta(1, 1)
+  
+}
+```
+
+```{r include=FALSE}
+#Set initial values for beta and tau
+init_values <- function(){
+  list(beta = rep(0, p), gamma = rep(1, p))
+}
+
+params = c("beta", "gamma") #parameters on which we are interested
+jags_data = with(asteroids, list(y = y.train, X = X.train, n = length(y.train), p = p))
+```
+
+```{r include=FALSE}
+# Posterior approximation
+set.seed(42)
+jags_posterior = jags(data = jags_data, inits = init_values,
+                      parameters.to.save = params,
+                      model.file = logistic_regr_jags,
+                      n.chains = 1, n.iter = 5000,
+                      n.burnin = 1000, n.thin = 1)
+
+out = jags_posterior$BUGSoutput
+
+# Extract samples from the posterior of beta and gamma
+
+beta_post_logit  = out$sims.list$beta
+gamma_post_logit = out$sims.list$gamma
+
+S = nrow(gamma_post_logit)
+```
+
+```{r echo=FALSE}
+# Plot beta 4 and 8
+par(mfrow=c(1,2), mar = c(5, 4, 4, 2) + 0.1 ) 
+
+beta_val <- seq(-150,150,length=1000)
+hist(beta_post_logit[,4],
+     main=paste("Posterior distribution of Est. Diameter"),
+     xlab = "Est. Diam.", cex=0.8, prob = TRUE, cex.main = .8, col="#1C39BB")
+lines(density(beta_post_logit[,4]), col = "#DE3163", lwd=2)
+lines(beta_val,dnorm(beta_val,0,1),col = "#FFD800", lwd=2)
+mtext("Figure 5", side=1, line=4, cex=0.7)
+legend("topright",legend = c("Prior", "Posterior"), 
+       col = c("#FFD800","#DE3163"), cex=0.7, lwd =1)
+
+beta_val <- seq(-15,10,length=1000)
+hist(beta_post_logit[,8],
+     main=paste("Posterior distribution of Min. Orbit Intersection"),
+     xlab = "Min. Orbit Int.", cex=0.8, prob = TRUE, cex.main = .8, col="#1C39BB")
+lines(density(beta_post_logit[,8]), col = "#DE3163", lwd=2)
+lines(beta_val,dnorm(beta_val,0,1),col = "#FFD800", lwd=2)
+mtext("Figure 6", side=1, line=4, cex=0.7)
+legend("topright",legend = c("Prior", "Posterior"), 
+       col = c("#FFD800","#DE3163"), cex=0.7, lwd =1)
+```
+
+Figures 5 and 6 show the posterior distributions of the coefficients associated with Estimated Diameter and Minimum Orbit Intersection under the logit model, while the red curves are the estimated posterior densities and the yellow lines correspond to the standard normal priors. Compared to the priors, both posterior distributions are more concentrated, indicating that the data have significantly informed the estimation of these coefficients. The coefficient for Estimated Diameter remains centered around zero but with reduced variance, suggesting a moderate and possibly weak effect. In contrast, the posterior distribution for Minimum Orbit Intersection is clearly shifted to the left and displays a sharper peak, reflecting a stronger and more consistent influence on the probability of an asteroid being hazardous.
+
+We compute **summary statistics** for each regression coefficient $\beta_j$, including:
+
+- Posterior Mean
+
+- Posterior Standard Deviation
+
+- 95% Credible Interval
+
+- Posterior Inclusion Probability
+
+```{r include=FALSE}
+# Posterior summaries for beta
+beta_summary = apply(beta_post_logit, 2, function(x) {
+  c(mean = mean(x),
+    sd = sd(x),
+    CI_lower = quantile(x, 0.025),
+    CI_upper = quantile(x, 0.975))
+})
+
+# Posterior inclusion probabilities
+gamma_inclusion_prob = colMeans(gamma_post_logit)
+
+# Combine into a data frame
+posterior_summary = as.data.frame(t(beta_summary))
+posterior_summary$Inclusion_Prob = gamma_inclusion_prob
+
+# Round for presentation
+posterior_summary = round(posterior_summary, 4)
+posterior_summary$Coefficient = colnames(X.train)
+posterior_summary <- posterior_summary[, c(6, 1:5)]
+
+# Sort posterior summary by inclusion probability (descending)
+posterior_summary_sorted = posterior_summary[order(-posterior_summary$Inclusion_Prob), ]
+
+# Display the sorted table
+posterior_summary_sorted[,c(1,2,3,6)]
+```
+
+
+Variables like Estimated Diameter and Minimum Orbit Intersection show high inclusion probabilities, meaning they are consistently selected across posterior draws. Others like Miss Distance and Inclination have low inclusion probabilities, suggesting weak or no association with the hazard classification outcome.
+
+To assess the quality of the approximation obtained through the Metropolis-Hastings algorithm, we perform a set of diagnostic checks using the following tools:
+
+**Trace plot**: graphical representation of the sampled values $\theta^{(s)}$ across iteration *s* = 1, ..., *S*. For a good approximation, the chain should exhibit no trends and it should be concentrated within a region of high posterior probability, centered around the mode of $P(\theta|\boldsymbol{y})$.
+
+```{r echo=FALSE}
+#trace plot
+par(mfrow=c(1,2))
+plot(out$sims.matrix[,3], ylab = "Estimated Diameter", xlab = "s", type = "l")
+mtext("Figure 7", side=1, line=4, cex=0.7)
+plot(out$sims.matrix[,8], ylab = "Min. Orbit Intersection", xlab = "s", type = "l")
+mtext("Figure 8", side=1, line=4, cex=0.7)
+```
+
+Figures 7 and 8 show the trace plots of the draws for the coefficients associated with the variables Estimated Diameter and Minimum Orbit Intersection. Both plots look nice, indeed there seem to be no trends and the values are quite concentrated in a region, even if there are some peaks. Furthermore, the burn-in period of 1000 draws is sufficient to reach convergence of the chain. 
+
+
+**Auto Correlation Function**: a measure of correlation in a Markov Chain. For a good approximation, the autocorrelation between various lags should decay rapidly towards zero. This indicates that successive observations are weakly correlated.
+
+```{r echo=FALSE}
+#autocorrelation
+par(mfrow=c(1,2))
+acf(out$sims.matrix[,3], xlab = "lag", main = "Estimated Diameter")
+mtext("Figure 9", side=1, line=4, cex=0.7)
+acf(out$sims.matrix[,8], xlab = "lag", main = "Minimum Orbit Intersection")
+mtext("Figure 10", side=1, line=4, cex=0.7)
+```
+
+We can see from the ACF for Estimated Diameter (Figure 9) and Minimum Orbit Intersection (Figure 10) that the level of autocorrelation is very low for every lag, and this indicates that we don't need to thin the chain. It holds also for all the other coefficients.
+
+
+**Geweke test**: a statistical test that compares the means of two subsets of the chain, one consisting of the first X% samples and the other consisting of the last Y% samples. If the chain converges, it is expected that these means are similar. Otherwise we should consider increasing the burn-in period. We choose X = Y = 10%.
+
+```{r echo=FALSE}
+#Geweke test (Null hypothesis: l'algoritmo converge (alfa = 0.05))
+gw <-geweke.diag(out$sims.matrix[,c(1:17)], frac1 = 0.1, frac2 = 0.1)
+gw <- round(gw$z, 4)
+kable(t(gw[1:9]))
+kable(t(gw[10:17]))
+```
+
+The output of the test are the values of the test statistic for each of the parameters in the model.Such statistic is asymptotically Standard Normal, therefore at significance level 5% we don't reject the null hypothesis for any $\beta$, since all the values are between -1.96 and 1.96. Thus we can say that all the chains have reached convergence and the burn-in period of 1000 draws is adequate.
+
+**Effective Sample Size**: measures how much information is loss due to autocorrelation in the sequence. Although our sequence may have a sample size of N, our effective sample size could be smaller or even bigger due to the correlation and redundancy between the samples.
+
+```{r echo=FALSE}
+# Effective Sample Size
+G = length(out$sims.matrix[,c(1:17)])
+ESS <- effectiveSize(x = out$sims.matrix[,c(1:17)])
+kable(t(ESS[1:9]))
+kable(t(ESS[10:17]))
+```
+
+All the estimated coefficients have an effective sample size equal or almost equal to the real sample size, 4000. This confirms that we don't have autocorrelation issues.
+
+
+## 4.2 Probit regression
+
+We apply the probit regression model, as outlined in Section 2.2, to the asteroid dataset using a Metropolis-Hastings algorithm, without relying on the latent variable representation. The hyperparameters for the priors are set to the same values used in the previous chapter.
+
+```{r include=FALSE}
+jags_data = with(asteroids, list(y = y.train, X = X.train, n = length(y.train), p = p))
+
+probit_regr_jags = function(){
+  
+  # Likelihood:
+  for(i in 1:n){
+    y[i] ~ dbern(pi[i])
+    probit(pi[i]) = (gamma*beta)%*%X[i,]
+  }
+  
+  # Priors:
+  for(j in 1:p){
+    beta[j] ~ dnorm(0, 1)
+  }
+  
+  for(j in 1:p){
+    gamma[j] ~ dbern(w)
+  }
+  
+  w ~ dbeta(1, 1)
+  
+}
+```
+
+```{r include=FALSE}
+#Set initial values for beta and tau
+init_values = function(){
+  
+  list(beta = rep(0, p), gamma = rep(1, p))
+  
+}
+
+params = c("beta","gamma") #parameters on which we are interested
+
+# Posterior
+set.seed(10)
+jags_posterior = jags(data = jags_data, inits = init_values,
+                      parameters.to.save = params,
+                      model.file = probit_regr_jags,
+                      n.chains = 1, n.iter = 5000,
+                      n.burnin = 1000, n.thin = 1)
+
+Pout = jags_posterior$BUGSoutput
+
+## Extract samples from the posterior of beta and gamma
+
+beta_post_probit  = Pout$sims.list$beta
+gamma_post_probit = Pout$sims.list$gamma
+
+S = nrow(gamma_post_probit)
+```
+
+
+```{r echo=FALSE}
+# Plot beta 4 and 8
+par(mfrow=c(1,2)) 
+
+Pbeta_val <- seq(-4,4,length=1000)
+hist(beta_post_probit[,4],
+     main=paste("Posterior distribution of Est. Diameter"),
+     xlab = "Est. Diam.", cex=0.8, prob = TRUE, cex.main = .8, col="#1C39BB")
+lines(density(beta_post_probit[,4]), col = "#DE3163", lwd=2)
+lines(Pbeta_val,dnorm(Pbeta_val,0,1),col = "#FFD800", lwd=2)
+mtext("Figure 11", side=1, line=4, cex=0.7)
+legend("topright",legend = c("Prior", "Posterior"), 
+       col = c("#FFD800","#DE3163"), cex=0.7, lwd =1)
+
+Pbeta_val <- seq(-10,10,length=1000)
+hist(beta_post_probit[,8],
+     main=paste("Posterior distribution of Min. Orbit Intersection"),
+     xlab = "Min. Orbit Int.", cex=0.8, prob = TRUE, cex.main = .8, col="#1C39BB")
+lines(density(beta_post_probit[,8]), col = "#DE3163", lwd=2)
+lines(Pbeta_val,dnorm(beta_val,0,1),col = "#FFD800", lwd=2)
+mtext("Figure 12", side=1, line=4, cex=0.7)
+legend("topright",legend = c("Prior", "Posterior"), 
+       col = c("#FFD800","#DE3163"), cex=0.7, lwd=2)
+```
+
+Figures 11 and 12 display the posterior distributions of the coefficients for the variables Estimated Diameter and Minimum Orbit Intersection, respectively, obtained under the probit model, while the yellow curves show the standard normal priors, and the red curves represent the posterior densities. In both cases, we observe a very similar behavior with respect to the logit model: the posterior distribution for Estimated Diameter remains centered around zero but with reduced variance, suggesting a moderate and possibly weak effect, while the posterior distribution for Minimum Orbit Intersection is clearly shifted to the left and displays a sharper peak.
+
+We check again the same **diagnostics** tools, reporting the results only for one coefficient, since the results are very similar to the previous paragraph:
+
+```{r echo=FALSE}
+# trace plot and acf
+par(mfrow=c(1,2))
+acf(Pout$sims.matrix[,3], xlab = "lag", main = "Estimated Diameter")
+mtext("Figure 13", side=1, line=4, cex=0.7)
+plot(Pout$sims.matrix[,3], ylab = "Est.Diam.", xlab = "s", type = "l")
+mtext("Figure 14", side=1, line=4, cex=0.7)
+```
+
+Figures 13 and 14 display the autocorrelation function (ACF) and the trace plot for the posterior draws of the Estimated Diameter coefficient in the probit model. In Figure 13, the ACF drops rapidly and remains close to zero across lags, indicating low autocorrelation among the sampled values and thus good mixing of the Markov chain. Figure 14 further supports this by showing a stable trace plot with no evident trends or drift, suggesting that the chain has reached convergence and is exploring the posterior distribution efficiently. The absence of significant autocorrelation and the dense concentration of the chain around a fixed region confirm the reliability of the samples for inference.
+
+
+**Geweke test:**
+
+```{r echo=FALSE}
+#Geweke test
+gw.p <- geweke.diag(Pout$sims.matrix[,c(1:17)], frac1 = 0.1, frac2 = 0.1)
+gw.p <- round(gw.p$z, 4)
+kable(t(gw[1:9]))
+kable(t(gw[10:17]))
+```
+
+For the Geweke test, again we don't reject the null hypothesis for any $\beta$ at a 5% significance level.
+
+
+**Effective Sample Size:**
+
+```{r echo=FALSE}
+# Effective Sample Size
+G.p = length(Pout$sims.matrix[,c(1:17)])
+ESS.p = effectiveSize(x = Pout$sims.matrix[,c(1:17)])
+kable(t(ESS.p[1:9]))
+kable(t(ESS.p[10:17]))
+```
+
+In general, the ESS values are very similar or even slightly exceeding the nominal sample size of 4000, indicating excellent mixing of the Markov chain and a low level of autocorrelation. The few coefficients with slightly lower ESS values still retain sufficient effective sample sizes to ensure reliable posterior estimates. 
+
+
+# 5 Prediction: comparison between Logit and Probit models
+
+We now evaluate the predictive performance of the logit and probit regression models on the test dataset. Using Bayesian Model Averaging (BMA), we estimate the probability that each asteroid is hazardous. These probabilities are then converted into binary predictions based on a classification threshold. We select the best threshold as the one that maximizes the test accuracy. Then, we assess the best model performance using a **confusion matrix**.
+
+```{r include=FALSE}
+# Predictions for logit
+
+# Setup
+n = nrow(X.test)
+S = dim(beta_post_logit)[1]
+
+# Initialize a matrix for linear predictors
+eta = matrix(0, nrow=n, ncol=S)
+
+# Linear Predictor for each row. So we will have 110 rows and 4500 columns 
+# beta_post_logit is the SPIKE AND SLAB output
+for(i in 1:n){
+  for(s in 1:S){
+    eta[i,s] = (gamma_post_logit[s,]*beta_post_logit[s,])%*%X.test[i,]
+  }
+}
+
+# Apply inverse logit transformation and compute posterior predictive mean
+pi_star_logit = apply(exp(eta) / (1 + exp(eta)), 1, mean)
+
+# Generate binary predictions using threshold = 0.5
+y_star_logit <- ifelse(pi_star_logit > 0.5, 1, 0)
+```
+
+```{r include=FALSE}
+# Predictions for probit
+
+# Setup
+n = nrow(X.test)
+S = dim(beta_post_probit)[1]
+
+# Initialize a matrix for linear predictors
+eta = matrix(0, nrow=n, ncol=S)
+
+# Linear Predictor for each row. So we will have 110 rows and 4500 columns 
+for(i in 1:n){
+  for(s in 1:S){
+    eta[i,s] = (gamma_post_probit[s,]*beta_post_probit[s,])%*%X.test[i,]
+  }
+}
+
+# Apply inverse logit to approximate probit prediction
+pi_star_probit = apply(exp(eta) / (1 + exp(eta)), 1, mean)
+
+# Generate binary predictions
+y_star_probit <- ifelse(pi_star_probit > 0.5, 1, 0)
+```
+
+```{r include=FALSE}
+# Tune threshold - Logit
+thresholds <- seq(0.01, 0.99, by = 0.01)
+accuracies_logit <- numeric(length(thresholds))
+
+for (i in seq_along(thresholds)) {
+  y_pred <- ifelse(pi_star_logit > thresholds[i], 1, 0)
+  accuracies_logit[i] <- mean(y_pred == y.test)
+}
+
+best_thresh_logit <- thresholds[which.max(accuracies_logit)]
+best_acc_logit <- max(accuracies_logit)
+```
+
+```{r include=FALSE}
+# Tune theshold - probit
+accuracies_probit <- numeric(length(thresholds))
+
+for (i in seq_along(thresholds)) {
+  y_pred <- ifelse(pi_star_probit > thresholds[i], 1, 0)
+  accuracies_probit[i] <- mean(y_pred == y.test)
+}
+
+best_thresh_probit <- thresholds[which.max(accuracies_probit)]
+best_acc_probit <- max(accuracies_probit)
+```
+
+```{r echo=FALSE}
+# Plot ROC and compute AUC
+roc_logit <- roc(y.test, pi_star_logit, quiet = TRUE)
+roc_probit <- roc(y.test, pi_star_probit, quiet = TRUE)
+
+# Plot
+plot(roc_logit, col = "blue", main = "ROC Curves for Logit and Probit", legacy.axes = TRUE)
+lines(roc_probit, col = "red")
+legend("bottomright", legend = c("Logit", "Probit"), col = c("blue", "red"), lwd = 2)
+mtext("Figure 15", side=1, line=4, cex=0.7)
+
+# AUC values
+auc_logit <- auc(roc_logit)
+auc_probit <- auc(roc_probit)
+```
+
+The ROC curve visually confirms the strong performance of both models. The curves for both models almost completely overlap, meaning they are nearly indistinguishable in their ability to separate the two classes
+
+```{r echo=FALSE}
+cat("Best threshold (Logit):", best_thresh_logit, "\n")
+cat("Test Accuracy (Logit):", best_acc_logit, "\n")
+cat("AUC (Logit):", auc_logit, "\n\n")
+
+cat("Best threshold (Probit):", best_thresh_probit, "\n")
+cat("Test Accuracy (Probit):", best_acc_probit, "\n")
+cat("AUC (Probit):", auc_probit, "\n")
+```
+
+Despite slight differences in thresholds and AUC values, both models achieve the same test accuracy, indicating that in practical terms, either model would be equally effective. We show next the confusion matrix and the classification report for the probit model with the best threshold:
+
+```{r echo=FALSE}
+# Confusion matrix of probit with best threshold
+y_pred_probit_opt <- ifelse(pi_star_probit > best_thresh_probit, 1, 0)
+confusionMatrix(as.factor(y_pred_probit_opt), as.factor(y.test), positive = "1")
+```
+
+The high values of Accuracy, Sensitivity and Specificity confirm that the probit model offers a very good classification performance at the selected threshold.
+
+
+# 6 Conclusion
+
+In this project, we applied Bayesian Model Averaging (BMA) with logit and probit models to predict whether an asteroid is classified as hazardous based on its physical and orbital features. Through a comprehensive Bayesian framework, we were able to not only incorporate model uncertainty but also derive full posterior distributions over parameters, allowing for deeper inference and robust predictions.
+
+We thoroughly examined the posterior distributions, assessed convergence diagnostics, and validated model performance using the test set. Key findings include:
+
+- Both the logit and probit models achieved exceptionally high **predictive accuracy** on the test data, with an optimal threshold accuracy of 96.6% and AUC values above 0.99, indicating excellent discriminative ability.
+
+- Posterior and prior comparisons showed that the data had a strong influence on the estimates of key variables such as Estimated Diameter and Minimum Orbit Intersection, which were also supported by effective sample sizes and trace diagnostics.
+
+The results suggest that both modeling approaches are highly suitable for this type of binary classification task in a space science context and they are practically **interchangeable** in terms of performance.
+
+Future extensions of this work could include the use of hierarchical priors, nonlinear predictors, or exploring Bayesian neural networks to capture more complex relationships within the data.
+
