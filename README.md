@@ -7,7 +7,7 @@ This repository contains the projects I worked on during my master's degree in D
 
 5. **Text Mining (Python)**:
 
-7. **Deep Learning (Python)**: this project involves training a Convolutional Neural Network from scratch to classify weather conditions from images into 11 categories (e.g., Rain, Snow, Fog) within the PyTorch framework. The model architecture is based on Inception v1 (GoogLeNet) with Batch Normalization. The network is trained and evaluated with techniques like early stopping and class weighting to address overfitting and class imbalance. The final model achieves high accuracy and shows potential for real-world applications like weather monitoring from visual data.
+7. **Deep Learning (Python)**: this project involves training a Convolutional Neural Network from scratch (PyTorch) to classify weather conditions from images into 11 categories (e.g., Rain, Snow, Fog). The model architecture is based on Inception v1 (GoogLeNet) with Batch Normalization. The network is trained and evaluated with techniques like early stopping and class weighting to address overfitting and class imbalance. The final model achieves high accuracy and shows potential for real-world applications like weather monitoring from visual data.
 
 9. **Statistical Learning**:
 
