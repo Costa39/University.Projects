@@ -1,0 +1,722 @@
+---
+title: 'Titanic: Machine Learning from disaster'
+author: "Alex Costa, Giovanni Caminiti | Università Cattolica del Sacro Cuore"
+date: "12/03/2025"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r include=FALSE}
+library('ggplot2')
+library('ggthemes')
+library('scales')
+library('dplyr')
+library('mice')
+library('caret')
+library('ROCR')
+library('glmnet')
+library('leaps')
+library('class')
+library('randomForest')
+library('e1071')
+library('mgcv')
+library('gbm')
+library('knitr')
+```
+
+# Introduction and data loading
+
+The sinking of the Titanic is one of the most infamous shipwrecks in history.
+
+On April 15, 1912, during her maiden voyage, the widely considered “unsinkable” RMS Titanic sank after colliding with an iceberg. Unfortunately, there weren’t enough lifeboats for everyone onboard, resulting in the death of 1502 out of 2224 passengers and crew.
+
+While there was some element of luck involved in surviving, it seems some groups of people were more likely to survive than others. In this challenge, we are asked to build a predictive model that answers the question: “what sorts of people were more likely to survive?” using passenger data.
+
+The dataset was taken from Kaggle at this link: https://www.kaggle.com/competitions/titanic and it consist of 891 observations of 12 variables: 
+
+```{r echo=FALSE}
+data <- read.csv('train.csv')
+glimpse(data)
+```
+
+We have: 4 numerical variables, of which 2 continuous (Age, Fare) and 2 discrete (SibSp, Parch); 4 categorical variables (Survived, Sex, Embarked, Pclass); 3 alphanumeric data variables (Name, Ticket, Cabin).
+
+We remove the variables Id, Name, Ticket and Cabin because the first is just an identification and the others are alphanumeric and we are not going to use them in the analysis.
+
+```{r include=FALSE}
+set.seed(42)
+data <- data |> 
+  select(-c(PassengerId, Ticket, Cabin))
+```
+
+# Missing values
+
+First of all we check for the presence of missing values in the dataset.
+
+```{r echo=FALSE}
+colSums(is.na(data))
+```
+We have 177 missing values for Age. We choose to impute the missing values using the Multivariate Imputation by Chained Equations (MICE) technique. It is an iterative method that imputes missing values in each variable using models based on the other variables in the dataset. MICE can use different imputation methods, we use the Predictive Mean Matching which is good to preserve the original data distribution.
+
+```{r include=FALSE}
+imputed_data <- mice(data, method = "pmm", m = 5)
+data <- complete(imputed_data)
+colSums(is.na(data))
+```
+
+```{r include=FALSE}
+data[which(data$Embarked == ""), "Embarked"] = "C"
+```
+
+# Exploratory Data Analysis
+
+Before starting the exploratory data analysis we replace the variables SibSp (number of siblings and spouses aboard) and Parch (number of parents and children aboard) with their sum, which represents the Family Size. We then convert this variable into a categorical by grouping in this way:
+
+- Single: Family Size = 1
+- Small: Family Size = 2 to 3
+- Medium: Family Size = 4 to 5
+- Large: Family Size $\ge$ 6
+
+```{r include=FALSE}
+# Create the variables family and family size
+data$Family <- data$SibSp + data$Parch + 1
+data$Fsize <- cut(data$Family, breaks = c(0, 1, 3, 5, Inf), 
+                   labels = c("Single", "Small", "Medium", "Large"), right = TRUE)
+```
+
+```{r include=FALSE}
+# qualitative variables -> factors
+data <- data |> 
+  mutate(Survived = factor(Survived),
+         Pclass = factor(Pclass),
+         Sex = factor(Sex),
+         SibSp = factor(SibSp),
+         Parch = factor(Parch),
+         Embarked = factor(Embarked))
+```
+
+```{r echo=FALSE}
+summary(data)
+```
+
+Form the summary of the data we get some early information about passengers in dataset:
+
+- around 38% of the 891 passengers survived
+- 65% were male
+- the mean age is around 30 years and there are few elderly passengers and children
+- 60% of the passengers traveled without any family member aboard
+- fares varied significantly with few passengers paying a very high price with respect to others (mean = 32, max = 512).
+
+We go deeper in the exploratory analysis by looking at some plots.
+
+```{r echo=FALSE, out.width="80%", fig.align="center"}
+# Hisogram of age by survival
+ggplot(data, aes(x = Age, fill = factor(Survived))) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = c("#D73027", "#56B4E9"), labels = c("Died", "Survived")) +
+  scale_x_continuous(breaks = seq(0, 80, by = 5)) +  # Adds ticks every 5 years
+  labs(title = "Distribution of Age by Survival",
+       x = "Age",
+       y = "Count",
+       fill = "Survival Status") +
+  theme_minimal()
+```
+
+From this histogram we observe that:
+- Infants (age 0-1 approximately) had very high survival rate
+- The oldest passenger (Age = 80) survived
+- A large proportion of 18-25 and 40-45 year old passengers did not survive
+
+```{r echo=FALSE, out.width="80%", fig.align="center"}
+# Hisogram of fare by survival
+ggplot(data, aes(x = Fare, fill = factor(Survived))) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = c("#D73027", "#56B4E9"), labels = c("Died", "Survived")) +
+  labs(title = "Distribution of Fare by Survival",
+       x = "Fare",
+       y = "Count",
+       fill = "Survival Status") +
+  theme_minimal()
+```
+
+We can see that the higher the fare, the higher the proportion of survival.
+
+```{r echo=FALSE, out.width="80%", fig.align="center"}
+# Barplot of Survival by family Size
+ggplot(data, aes(x = Fsize, fill = factor(Survived))) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("#D73027", "#56B4E9"), labels = c("Died", "Survived")) +
+  labs(title = "Family Size vs Survival",
+       x = "Family Size",
+       y = "Count",
+       fill = "Survival Status") +
+  theme_minimal()
+```
+
+Singles and people with a large number of family components on board have a larger mortality rate with respect to people with 1 to 4 members aboard.
+
+```{r echo=FALSE, out.width="80%", fig.align="center"}
+# Barplot of Survival by Class
+ggplot(data, aes(x = Pclass, fill = factor(Survived))) +
+  geom_bar(position = "fill") +  # Proportions instead of counts
+  scale_fill_manual(values = c("#D73027", "#56B4E9"), labels = c("Died", "Survived")) +
+  labs(title = "Pclass vs Survival (Proportion)", x = "Passenger Class", y = "Proportion") +
+  theme_minimal()
+```
+
+Clearly the proportion of survived is higher for higher classes. This is consistent with what we have seen for fare.
+
+```{r echo=FALSE, out.width="80%", fig.align="center"}
+# Barplot of Survival by Embarked
+ggplot(data, aes(x = Embarked, fill = factor(Survived))) +
+  geom_bar(position = "fill") +  # Proportions instead of counts
+  scale_fill_manual(values = c("#D73027", "#56B4E9"), labels = c("Died", "Survived")) +
+  labs(title = "Embarked vs Survival", x = "Embarked", y = "Proportion") +
+  theme_minimal()
+```
+
+The port where passengers where embarked seems to be also correlated with the survival, indeed people embarked in Cherbourg have an higher survival rate with respect to the ones embarked in Queenstown and Southampton.
+
+
+```{r echo=FALSE, out.width="80%", fig.align="center"}
+# Barplot Of Survival by Sex and Class
+ggplot(data, aes(x = Sex, fill = factor(Survived))) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ Pclass) +
+  scale_fill_manual(values = c("#D73027", "#56B4E9"), labels = c("Died", "Survived")) +
+  labs(title = "Survival Rate by Sex and Pclass", x = "Sex", y = "Count") +
+  theme_minimal()
+```
+
+The survival rate is different for the combinations of sex and class. But the most important facts remain the same: females are more likely to survive than men and passengers in first class are more likely to survive than the others. Nevertheless we will include an interaction between sex and age because we will see that it is significant.
+
+```{r echo=FALSE, out.width="80%", fig.align="center"}
+par(mfrow=c(1,2))
+plot(data$Age~data$Survived, col = ifelse(data$Survived == 1, "#56B4E9", "#D73027"),
+     xlab="Survived", ylab = "Age")
+plot(data$Fare~data$Survived, col = ifelse(data$Survived == 1, "#56B4E9", "#D73027"),
+     xlab="Survived", ylab = "Fare")
+```
+
+Fare seems to have a strongest effect than age on survived.
+
+
+```{r echo=FALSE, out.width="80%", fig.align="center"}
+plot(data[, c("Age", "Fare")], col = ifelse(data$Survived == 1, "#56B4E9", "#D73027"), 
+     pch = 16, cex = 0.8, main = "Survival by Age and Fare")
+```
+
+We check the linear correlation between the numerical covariates, which are only age and fare if we consider family grouped in categories:
+
+```{r echo=FALSE}
+cor(data$Age,data$Fare)
+```
+
+Age and Fare are not significantly linearly correlated.
+
+Exploratory analysis summary:
+
+- Women had an higher survival rate than men
+- Survival rate was higher for higher classes
+- Small and medium families had an higher survival rate then singles and large families
+- Very young and very old passengers had an higher survuval rate than the others
+
+# Data preparation
+
+We remove the variables SibSp and Parch and we keep Fsize. We then scale the numerical covariates.
+
+```{r include=FALSE}
+# Remove SibSp, Parch and Family
+data <- data |> 
+  select(-c(SibSp, Parch, Family))
+
+# Scale Age and Fare
+d.quant <- data[,5:6]
+d.quant.scaled <- as.data.frame(scale(d.quant))
+
+apply(d.quant.scaled,2,sd)
+apply(d.quant.scaled,2,mean)
+```
+
+
+```{r include=FALSE}
+# Reconstruct scaled dataframe
+data.scaled <- cbind(data[,"Name"], data[,"Sex"], data[,"Pclass"], data[, "Embarked"],  data[,"Fsize"], d.quant.scaled, data[,"Survived"])
+colnames(data.scaled) <- c("Name", "Sex", "Pclass", "Embarked", "Fsize", "Age", "Fare", "Survived")
+```
+
+Then we split the dataset in train set (80%) and test set (20%).
+
+```{r include=FALSE}
+# Splitting into train and test sets
+n = dim(data.scaled)[1]
+set.seed(42)
+select.test = sample(1:n,n*0.2)
+
+train = as.data.frame(data.scaled[-select.test,-1])
+test = as.data.frame(data.scaled[select.test,-1])
+```
+
+Now the data are ready to be used for implementing our models. 
+
+# Logistic regression
+
+The first model we consider is a logistic regression with Survived as responde and all the other variables as covariates (without interactions):
+
+```{r echo=FALSE}
+logit_1 <- glm(Survived ~ ., family = "binomial", data = train)
+summary(logit_1)
+```
+
+The coefficients estimated by the model suggest:
+
+- The intercept estimate is significant and equal to 2.84, meaning that when all covariates are at their reference levels, the probability of survival is approximately 95%.
+
+- Sexmale estimate is significant and indicates that being male significantly reduces the log-odds of survival compared to females. This confirms that gender is a strong predictor of survival.
+
+- Pclass: Passengers in second class have significantly lower survival odds than first-class passengers and third-class passengers have even lower survival odds. This suggests a strong effect of socioeconomic status on survival.
+
+- Embarked: at signifcance level 5% there is not a significant difference between the ports of embarkation. 
+- Fsize: large families have significantly lower survival odds, possibly due to difficulties in evacuating together. Small and Medium size families have not a significantly difference in the survival odds with respect to singles.
+
+- Age: Older passengers have significantly lower survival odds, indicating that younger individuals had a better chance of survival.
+
+- Fare: the effect of fare on survival is not statistically significant, likely due to its correlation with passenger class.
+
+
+The model fits well but could potentially be improved by feature selection or interaction terms.
+
+```{r include=FALSE}
+# Predict probabilities on test set
+prob <- predict(logit_1, newdata = test, type = "response")
+pred <- prediction(prob, test$Survived)
+
+# Compute accuracy for different thresholds
+acc <- performance(pred, "acc")
+
+# Find optimal threshold (max accuracy)
+index <- which.max(acc@y.values[[1]])
+opt.threshold <- acc@x.values[[1]][index]
+```
+
+
+```{r echo=FALSE}
+# Predictions, confusion matrix and metrics
+pred_class <- ifelse(prob > opt.threshold, 1, 0)
+conf_matrix <- confusionMatrix(as.factor(pred_class), as.factor(test$Survived))
+print(conf_matrix)
+acc_log1 <- conf_matrix$overall["Accuracy"]
+sens_log1 <- conf_matrix$byClass["Sensitivity"]
+spec_log1 <- conf_matrix$byClass["Specificity"]
+```
+The model has a good overall accuracy of 82.02%, which is much better than just predicting the most frequent class (No Information Rate of 61.24%). The sensitivity is very high (91%), meaning the model is good at detecting Class 0 instances, but the specificity is lower (68%), meaning the model could improve at identifying Class 1 instances.
+
+There is still room for improvement, so We try to add the interaction between Sex and Class
+
+```{r echo=FALSE}
+logit_2 <- glm(Survived ~ Age + Fare + Embarked + Fsize + Sex*Pclass, family = "binomial", data = train)
+summary(logit_2)
+```
+The addition of the interaction term improved the model fit, indeed both residual deviance and AIC decreased. The coefficients changed as well as their significance level. The main difference is that Pclass 2 is no more significant as well as the interaction between male and class 2. On the other hand, Pclass 3 and its interaction with male are significant, meaning that for males in 3rd class, the effect of being male on survival is significantly different compared to males in 1st class.
+
+
+```{r echo=FALSE}
+# Predictions on test set
+prob <- predict(logit_2, newdata = test, type = "response")
+pred <- prediction(prob, test$Survived)
+
+# Compute and plot ROC curve
+perf <- performance(pred, "tpr", "fpr")
+plot(perf, colorize = TRUE, lwd = 3, main = "ROC Curve - Logistic Regression with interaction")
+
+# Compute AUC
+auc <- performance(pred, "auc")
+auc_value <- as.numeric(auc@y.values)
+text(0.7, 0.2, paste("AUC:", round(auc_value, 4)))
+
+# Compute accuracy for different thresholds
+acc <- performance(pred, "acc")
+
+# Find optimal threshold (max accuracy)
+index <- which.max(acc@y.values[[1]])
+opt.threshold <- acc@x.values[[1]][index]
+```
+
+The model performs well in separating the two classes, as indicated by the AUC of 0.8699. The curve is well above the diagonal (which represents random guessing), confirming strong predictive power.
+
+
+```{r echo=FALSE}
+# Predictions, confusion matrix and metrics
+pred_class <- ifelse(prob > opt.threshold, 1, 0)
+conf_matrix <- confusionMatrix(as.factor(pred_class), as.factor(test$Survived))
+print(conf_matrix)
+```
+
+The model with interaction (0.8258) has a slightly better accuracy than the one without interaction (0.8202), indicating a marginal improvement in overall classification. The model with interaction sacrifices some sensitivity but improves specificity. It is slightly better overall.
+
+
+Now we apply Lasso to the last model to see if it shrinks to zero some of the coefficients improving the model's generalization ability. 
+
+```{r include=FALSE}
+# Prepare data for Lasso
+X_train <- model.matrix(Survived ~ Age + Fare + Embarked + Fsize + Sex*Pclass, data = train)[, -1]
+X_test <- model.matrix(Survived ~ Age + Fare + Embarked + Fsize + Sex*Pclass, data = test)[, -1]
+y_train <- train$Survived
+y_test <- test$Survived
+```
+
+```{r echo=FALSE}
+# Lasso with cross validation
+set.seed(42)
+cv.lasso <- cv.glmnet(X_train, y_train, alpha = 1, family = "binomial")
+
+# Best lambda
+best_lambda <- cv.lasso$lambda.min
+print(paste("Best Lambda:", round(best_lambda, 4)))
+
+# Fit final Lasso model
+lasso_model <- glmnet(X_train, y_train, alpha = 1, lambda = best_lambda, family = "binomial")
+print(coef(lasso_model))
+```
+
+Lasso shrinks the coefficients of EmbarkedQ and Pclass2 to zero, which were not significant in the previous model, but did not shrink other coefficients that were not significant.
+
+
+```{r echo=FALSE}
+# Predictions
+prob_lasso <- predict(lasso_model, newx = X_test, type = "response")
+
+# ROC Curve
+pred_lasso <- prediction(prob_lasso, y_test)
+perf_lasso <- performance(pred_lasso, "tpr", "fpr")
+plot(perf_lasso, colorize = TRUE, lwd = 3, main = "ROC Curve - Lasso Logistic Regression")
+
+# Compute AUC
+auc_lasso <- performance(pred_lasso, "auc")
+auc_lasso <- round(as.numeric(auc_lasso@y.values), 4)
+
+# Compute optimal threshold
+acc_lasso <- performance(pred_lasso, "acc")
+index <- which.max(acc_lasso@y.values[[1]])
+opt.threshold_lasso <- acc_lasso@x.values[[1]][index]
+
+# Add AUC value inside the plot
+text(0.7, 0.2, paste("AUC:", round(auc_lasso, 4)))
+
+# Predictions with optimal threshold
+pred_class_lasso <- ifelse(prob_lasso > opt.threshold_lasso, 1, 0)
+conf_matrix_lasso <- confusionMatrix(as.factor(pred_class_lasso), as.factor(y_test))
+print(conf_matrix_lasso)
+```
+
+The model with Lasso has exactly the same accuracy, sensitivity and specificity, and a AUC slightly higher (but almost equal). So we have the same performance with 2 coefficients "removed", hence we would choose this as the final logistic regression model.
+
+
+# KNN
+
+We use KNN with all the covariates and the interaction: categorical covariates can be used if they are properly encoded, in our case we used one-hot encoding. We choose the best value of the hyperparameter k using k-fold cross validation
+
+```{r echo=FALSE}
+# Cross validation to choose k
+k.explore = 1:30
+nfolds = 10
+
+set.seed(42)
+folds = sample(1:nfolds,dim(X_train)[1],replace = TRUE)
+CVerror = matrix(ncol=length(k.explore),nrow=nfolds)
+
+for(j in 1:nfolds){
+  for(k in k.explore){
+    prediction.KNN = knn(X_train[which(folds!=j),],X_train[which(folds==j),],
+                         cl=y_train[which(folds!=j)],k=k) 
+    CVerror[j,k] = mean(prediction.KNN != y_train[which(folds==j)])
+  }
+}
+plot(colMeans(CVerror),type='b',lwd=3, xlab="K")
+```
+
+The best is K = 18, so we use this value and make predictions on the test set.
+
+```{r echo=FALSE}
+# Prediction with best K
+prediction.KNN = knn(X_train,X_test,cl=y_train,k=18) 
+confusionMatrix(prediction.KNN,y_test)
+```
+
+Lasso logistic regression remains the best model so far, with higher accuracy and specificity.
+
+# Naïve Bayes
+
+We also use a Naïve Bayes classifier, without the interaction term because this method relies on the naïve assumption that all predictors are conditionally independent given the class label. This means that it does not account for interactions between variables. The predictors are assumed to have a Gaussian prior distribution.
+
+```{r include=FALSE}
+# Train Naïve Bayes model
+nb_model <- naiveBayes(Survived ~ ., data = train)
+
+# Predict probabilities and survival
+nb_prob <- predict(nb_model, newdata = test, type = "raw")
+nb_pred <- predict(nb_model, newdata = test, type = "class")
+```
+
+```{r echo=FALSE}
+# Confusion matrix
+conf_matrix <- confusionMatrix(nb_pred, as.factor(test$Survived))
+print(conf_matrix)
+
+# Compute AUC
+nb_pred_prob <- prediction(nb_prob[,2], test$Survived)
+nb_perf <- performance(nb_pred_prob, "tpr", "fpr")
+plot(nb_perf, colorize = TRUE, lwd = 3, main = "ROC Curve - Naïve Bayes")
+
+# AUC value
+nb_auc <- performance(nb_pred_prob, "auc")
+auc_value <- as.numeric(nb_auc@y.values)
+
+# Add AUC value inside the plot
+text(0.7, 0.2, paste("AUC:", round(auc_value, 4)))
+```
+
+Accuracy is 74% and specificity is very low (48%), so the best is still Lasso logistic regression.
+
+# Random Forest
+
+We run a cross validation for the random forest to choose the number of variables that are randomly sampled as candidates at each split.
+
+```{r include=FALSE}
+# 10-folds cross validation for random forest
+set.seed(42)
+
+# Define range of mtry values and folds
+mtry_values <- 1:6  
+K <- 10  
+folds <- createFolds(train$Survived, k = K, list = TRUE, returnTrain = FALSE)
+
+# Store errors for each mtry
+cv.err <- numeric(length(mtry_values))
+oob.err <- numeric(length(mtry_values))
+
+# Loop through each mtry value
+for (m in seq_along(mtry_values)) {
+  fold_errors <- numeric(K)
+
+  for (j in 1:K) {
+    # Split data into training and validation folds
+    train_fold <- train[-folds[[j]], ]
+    val_fold <- train[folds[[j]], ]
+
+    # Train the Random Forest model on training fold
+    rf_model <- randomForest(Survived ~ Age + Fare + Embarked + Fsize + Sex * Pclass, 
+                             data = train_fold, 
+                             mtry = mtry_values[m], 
+                             ntree = 2000)
+
+    # Predict on validation fold
+    pred <- predict(rf_model, val_fold)
+
+    # Compute classification error for this fold
+    fold_errors[j] <- mean(pred != val_fold$Survived)
+  }
+  
+  # Compute mean classification error across all folds
+  cv.err[m] <- mean(fold_errors)
+  
+  # Get OOB error from the final model trained on full train set
+  final_rf <- randomForest(Survived ~ Age + Fare + Embarked + Fsize + Sex * Pclass, 
+                           data = train, 
+                           mtry = mtry_values[m], 
+                           ntree = 2000)
+  oob.err[m] <- final_rf$err.rate[2000, 1]
+
+  # Print progress
+  cat("Tested: mtry =", mtry_values[m], 
+      "--> Mean CV Error =", round(cv.err[m], 5), 
+      "--> OOB Error =", round(oob.err[m], 5), "\n")
+}
+```
+
+```{r include=FALSE}
+# Plot both CV error and OOB error
+plot(mtry_values, cv.err, type = "b", pch = 19, col = "blue", 
+     ylim = range(c(cv.err, oob.err)), 
+     ylab = "Classification Error", xlab = "Number of Predictors Considered at each Split",
+     main = "Random Forest Cross-Validation vs OOB Error")
+
+points(mtry_values, oob.err, type = "b", pch = 19, col = "red")
+
+legend("topright", legend = c("CV Error", "OOB Error"), col = c("blue", "red"), pch = 19, lty = 1)
+
+# Find best mtry value based on CV Error
+opt_mtry <- mtry_values[which.min(cv.err)]
+cat("Optimal mtry based on CV Error:", opt_mtry, "\n")
+```
+
+
+The optimal value of mtry is 2 in terms of Out of Bag error, while the cv error is slightly better for mtry = 3. We use fit the final random forest with mtry = 2 and we increase the number of trees to 9000 because the accuracy increases and the computational time does not increase much.
+
+```{r echo=FALSE}
+# Fit the best random forest
+set.seed(42)
+rf_titanic <- randomForest(Survived ~ Age + Fare + Fsize + Sex * Pclass, 
+                                 data = train, 
+                                 mtry = 2,  
+                                 ntree = 9000,  
+                                 importance = TRUE)
+
+print(rf_titanic)
+
+# Predictions
+pred_probs_rf <- predict(rf_titanic, newdata = test, type = "prob")[,2]
+pred_class_rf <- ifelse(pred_probs_rf > 0.5, 1, 0)
+
+conf_matrix_rf <- confusionMatrix(as.factor(pred_class_rf), as.factor(test$Survived))
+print(conf_matrix_rf)
+
+# ROC Curve
+pred_rf <- prediction(pred_probs_rf, test$Survived)
+perf_rf <- performance(pred_rf, "tpr", "fpr")
+
+plot(perf_rf, colorize = TRUE, lwd = 3, main = "ROC Curve - Random Forest mtry=2")
+```
+
+The accuracy is the highest so far, 85%, and sensitivity and specificity are also very good. OOB Error Rate is 17.81%, indicating strong generalization. We check the importance of the predictors with 2 metrics: the first measures how much accuracy decreases when a feature is removed and the second measures the purity improvement in decision trees due to each feature.
+
+```{r echo=FALSE}
+# Check Feature Importance
+importance_values <- importance(rf_titanic)
+# Plot Feature Importance
+varImpPlot(rf_titanic, main = "Feature Importance - Random Forest")
+```
+
+Sex is the most influential feature in both metrics, confirming that gender played a major role in survival. Age and Fare have high Gini importance but low Accuracy decrease, meaning they help with tree splits, but removing them may not drastically reduce accuracy. Family Size is the least important in both metrics, suggesting that having family aboard was less critical compared to gender, age, and class.
+
+# Boosting
+
+The last method we implement is boosting with cross validation to tune the number of trees, the maximum depth of each tree and the shrinkage
+
+```{r include=FALSE}
+# Ensure Survived is numeric (0 and 1)
+train$Survived <- as.numeric(as.character(train$Survived))
+test$Survived <- as.numeric(as.character(test$Survived))
+```
+
+
+```{r include=FALSE}
+# Hyperparameters combinations grid
+depth_values <- 1:5  
+trees_values <- c(50, 100, 500, 1000, 5000)  
+shrinkage_values <- c(0.01, 0.05, 0.1, 0.2, 0.3)  
+
+params <- expand.grid(depth_values, trees_values, shrinkage_values)
+
+# K-fold cross-validation
+K <- 10  
+set.seed(42)
+folds <- createFolds(train$Survived, k = K, list = TRUE, returnTrain = FALSE)
+
+# Array to store MSE values
+MSE <- numeric(nrow(params))
+
+# Loop through all hyperparameter combinations
+for (i in 1:nrow(params)) {
+  fold_errors <- numeric(K)
+
+  for (j in 1:K) {
+    # Split data into training and validation folds
+    train_fold <- train[-folds[[j]], ]
+    val_fold <- train[folds[[j]], ]
+
+    # Train the boosting model on training fold
+    boost_model <- gbm(Survived ~ Age + Fare + Embarked + Fsize + Sex * Pclass, 
+                        data = train_fold, 
+                        distribution = "bernoulli",  
+                        n.trees = params[i,2], 
+                        interaction.depth = params[i,1], 
+                        shrinkage = params[i,3], 
+                        verbose = FALSE)
+    
+    # Predict on validation fold
+    yhat_boost <- predict(boost_model, newdata = val_fold, n.trees = params[i,2], type = "response")
+    
+    # Compute MSE for this fold
+    fold_errors[j] <- mean((yhat_boost - as.numeric(val_fold$Survived))^2)
+  }
+  
+  # Compute mean MSE across all folds
+  MSE[i] <- mean(fold_errors)
+  
+  # Print progress
+  cat("Tested: depth =", params[i,1], 
+      ", n.trees =", params[i,2], 
+      ", shrinkage =", params[i,3], 
+      " --> Mean CV MSE =", round(MSE[i], 5), "\n")
+}
+```
+
+```{r echo=FALSE}
+# Find best hyperparameters
+opt_params <- params[which.min(MSE),]
+print("Best hyperparameters:")
+print(opt_params)
+```
+
+The best hyperparametrs found with 10-fold cross-validation are ntrees = 500, interaction depth = 5, shrinkage = 0.05. We train the model with those values and evaluate its performance on the test set.
+
+```{r echo=FALSE}
+# Best boosting model
+set.seed(42)
+boost_titanic_opt <- gbm(Survived ~ Age + Fare + Embarked + Fsize + Sex*Pclass, 
+                          data = train, 
+                          distribution = "bernoulli",  
+                          n.trees = opt_params[2], 
+                          interaction.depth = opt_params[1], 
+                          shrinkage = opt_params[3], 
+                          verbose = FALSE)
+
+summary(boost_titanic_opt)
+```
+
+The relative influence of the variables in boosting is completely different from the one of random forest. Here fare is the most important while sex is in third place. Fsize remains the least influential one.
+
+```{r echo=FALSE}
+# Predictions
+pred_probs_boost <- predict(boost_titanic_opt, newdata = test, n.trees = opt_params[,2], type = "response")
+pred_class_boost <- ifelse(pred_probs_boost > 0.5, 1, 0)
+
+conf_matrix_boost <- confusionMatrix(as.factor(pred_class_boost), as.factor(test$Survived))
+print(conf_matrix_boost)
+```
+
+Accuracy is 83%, so random forest remains the best.
+
+# Conclusion
+
+In this analysis, we applied multiple machine learning models to predict passenger survival on the Titanic, in particular: Logistic Regression, KNN, Naïve Bayes, and methods based on trees like Random Forest and Boosting.
+
+These are the main findings we have achieved:
+
+1. Feature Importance: The most influential predictors were Fare, Age, and Sex, confirming that wealth and gender played a critical role in survival chances. Passenger Class, Port of Embarkation, and Family Size had a lower impact, and the interaction term Sex:Pclass had a small contribution to the models.
+
+2. The Random Forest model achieved the best performance with an accuracy of 85.4%, even if with a small unbalance between sensitivity (93.6%) and specificity (72.5%). This was a common behavior between all the models since the training set is a little bit unbalanced (38% survived). Logistic regression and boosting also performed well.
+
+3. Insights: Women and wealthier passengers had higher survival probabilities. The low importance of Embarked suggests departure location had minimal impact.
+
+The following is a summary table of the metrics of all the models used:
+
+```{r echo=FALSE}
+# Create a data frame with model performance metrics
+model_comparison <- data.frame(
+  Model = c("Logistic Regression (LASSO)", "KNN", "Naïve Bayes", "Random Forest", "Gradient Boosting"),
+  Accuracy = c(0.8258, 0.7753, 0.7416, 0.8539, 0.8315),
+  Sensitivity = c(0.8532, 0.8807, 0.9083, 0.9358, 0.8991),
+  Specificity = c(0.7826, 0.6087, 0.4783, 0.7246, 0.7246)
+)
+
+kable(model_comparison, caption = "Model Performance Comparison")
+```
+
+
+
+
+
+
